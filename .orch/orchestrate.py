@@ -1,0 +1,262 @@
+"""Agent orchestrator: every TASKS.md task runs on its own - work -> fresh review -> revision -> result.
+"mode: full" tasks use the multi-agent pipeline (plan -> parallel parts -> ring review -> merge -> integration review).
+Tasks with "after:" wait for those tasks; [sys] tasks change the orchestrator itself and are applied at the end.
+
+Lives in <project>/.orch/ and always works on <project>, the folder that contains .orch/.
+Usage (via the launcher at the project root):
+    orch                 run the pending tasks in TASKS.md      (PowerShell: .\\orch)
+    orch preview         show tasks, reviewer pairs and the agent count without running anything
+Options: [--max-parallel N] [--max-rounds 1] [--budget-per-agent 2.0] [--max-turns 40]
+         [--model NAME] [--cli-path PATH/TO/claude.exe]
+"""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import logging
+import shutil
+import sys
+from datetime import datetime
+from pathlib import Path
+
+import gitops
+from capacity import AutoParallel
+from context import RefLabel, RefTasks, ResolveRefs, ResultFiles, StaleNotices
+from taskfile import LinkDependencies, ParseTasks, RecordResult, UpdateTaskStatus
+from tasks import MAX_PARTS, STATUS_DONE, STATUS_FAILED, STATUS_PENDING, STATUS_RUNNING, Task, TaskFileError
+
+ORCH_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = ORCH_DIR.parent
+TASKS_FILE = PROJECT_ROOT / "TASKS.md"
+ROLE_SKILL_DIR = PROJECT_ROOT / ".claude" / "skills" / "develop"
+MAX_LISTED_REFS = 5  # preview lists this many ref entries per task
+
+
+def ParseArgs(argv: list[str] | None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog="orch", description="Run TASKS.md through parallel work, review and merge.")
+    parser.add_argument("command", nargs="?", choices=["run", "preview"], default="run", help="default: run")
+    parser.add_argument("--max-parallel", type=int, default=None, help="override the automatic agent count")
+    parser.add_argument("--max-rounds", type=int, default=1, help="review/revise rounds (0 = no review)")
+    parser.add_argument("--budget-per-agent", type=float, default=2.0, help="USD cap per agent call")
+    parser.add_argument("--max-turns", type=int, default=40, help="turn cap per agent call")
+    parser.add_argument("--model", default=None, help="model alias or ID (default: CLI default)")
+    parser.add_argument("--cli-path", default=None, help="native claude executable (auto-detected for npm installs)")
+    args = parser.parse_args(argv)
+    invalidParallel = args.max_parallel is not None and args.max_parallel < 1
+    if invalidParallel or args.max_rounds < 0 or args.budget_per_agent <= 0 or args.max_turns < 1:
+        parser.error("--max-parallel/--max-turns must be >= 1, --max-rounds >= 0, --budget-per-agent > 0")
+    return args
+
+
+def ConfigureOutput() -> None:
+    # Pipes and redirects (Claude Code, log files) get UTF-8; real consoles already render Unicode
+    for stream in (sys.stdout, sys.stderr):
+        if stream.isatty():
+            stream.reconfigure(errors="replace")
+        else:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
+
+def ResolveParallel(args: argparse.Namespace, tasks: list[Task]) -> tuple[int, str]:
+    """Global cap on concurrent agents across all tasks (one per standard task, up to MAX_PARTS per full task)."""
+    if args.max_parallel:
+        return args.max_parallel, "set by --max-parallel"
+    return AutoParallel(sum(MAX_PARTS if task.full else 1 for task in tasks))
+
+
+def WarnMissingRoles(tasks: list[Task]) -> None:
+    for task in tasks:
+        if task.role and not (ROLE_SKILL_DIR / f"{task.role}.md").is_file():
+            print(f"warning: {task.id} role skill '{task.role}' not found in {ROLE_SKILL_DIR}; running without it")
+
+
+def PrintPlan(tasks: list[Task], args: argparse.Namespace, parallel: int, reason: str) -> None:
+    print(f"{len(tasks)} pending task(s) in {TASKS_FILE} - each runs independently and yields its own result")
+    print("standard tasks: 1 agent -> fresh review -> revision (verified only after CRITICAL findings)")
+    if any(task.full for task in tasks):
+        print(f"mode: full tasks: planner splits into 1-{MAX_PARTS} parts, ring review, merge + integration review")
+    print(f"concurrent agents (all tasks): {parallel} ({reason}); review/revise rounds: {args.max_rounds}")
+    if any(task.kind == "code" for task in tasks):
+        repo = gitops.ResolveRepo(PROJECT_ROOT)
+        print(f"git: {repo[0]} @ {repo[1][:8]}" if repo else "git: NOT a repo with commits - code tasks will fail")
+    if any(task.kind == "sys" for task in tasks):
+        print("sys: edited in sandbox copies; applied to the project when the run ends if checks and reviews pass")
+    for task in tasks:
+        role = f":{task.role}" if task.role else ""
+        print(f"  {task.id} [{task.kind}{role}] {task.title}")
+        for label, value in TaskSettings(task):
+            print(f"      {label}: {value}")
+        for detail in task.details:
+            print(f"      {detail}")
+
+
+def TaskSettings(task: Task) -> list[tuple[str, str]]:
+    settings = []
+    if task.upstream:
+        waits = [f"{up.id} ({'this run' if up.status == STATUS_PENDING else StatusName(up.status)})" for up in task.upstream]
+        settings.append(("after", ", ".join(waits)))
+    refs = [TaskRefLabel(up) for up in RefTasks(task)]
+    refs += [RefLabel(path, PROJECT_ROOT) for path in task.refFiles] + task.refUrls
+    if refs:
+        more = f" (+{len(refs) - MAX_LISTED_REFS} more)" if len(refs) > MAX_LISTED_REFS else ""
+        settings.append(("ref", ", ".join(refs[:MAX_LISTED_REFS]) + more))
+    if task.outputLang:
+        settings.append(("lang", task.outputLang))
+    if task.verify:
+        settings.append(("verify", task.verify))
+    if task.full:
+        settings.append(("mode", task.mode))
+    return settings
+
+
+def TaskRefLabel(up: Task) -> str:
+    """"ref: Txx" as preview shows it: the result file, or that it comes from this run."""
+    if up.status == STATUS_PENDING:
+        return f"{up.id} result (this run)"
+    files = ", ".join(RefLabel(path, PROJECT_ROOT) for path in ResultFiles(up, PROJECT_ROOT))
+    history = f", reviews from run {up.resultRun}" if up.resultRun else ""
+    return f"{up.id} -> {files}{history}" if files else f"{up.id} (no result file)"
+
+
+def StatusName(status: str) -> str:
+    blocked = " - this task will be blocked"
+    names = {STATUS_DONE: "done", STATUS_FAILED: f"failed{blocked}", STATUS_RUNNING: f"stuck running{blocked}"}
+    return names.get(status, status)
+
+
+def CreateLogger(runDir: Path) -> logging.Logger:
+    logger = logging.getLogger("orch")
+    logger.setLevel(logging.DEBUG)
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%H:%M:%S")
+    console = logging.StreamHandler()
+    console.setLevel(logging.INFO)  # CLI stderr (DEBUG) stays in run.log only
+    for handler in (console, logging.FileHandler(runDir / "run.log", encoding="utf-8")):
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+    return logger
+
+
+def CreateContext(args: argparse.Namespace, parallel: int):
+    from runner import ResolveCliPath, RunContext  # lazy: keeps `preview` free of the SDK dependency
+
+    runId = datetime.now().strftime("%Y%m%d-%H%M%S")
+    runDir = ORCH_DIR / "runs" / runId
+    runDir.mkdir(parents=True)
+    repo = gitops.ResolveRepo(PROJECT_ROOT)
+    repoRoot, baseCommit = repo if repo else (None, None)
+    return RunContext(
+        runId=runId,
+        runDir=runDir,
+        projectDir=PROJECT_ROOT,
+        repoRoot=repoRoot,
+        worktreeDir=ORCH_DIR / "worktrees" / runId,
+        baseCommit=baseCommit,
+        budgetPerAgent=args.budget_per_agent,
+        maxTurns=args.max_turns,
+        model=args.model,
+        log=CreateLogger(runDir),
+        semaphore=asyncio.Semaphore(parallel),
+        cliPath=ResolveCliPath(args.cli_path),
+    )
+
+
+def MarkTasks(tasks: list[Task], statusOf, log: logging.Logger) -> None:
+    for task in tasks:
+        try:
+            UpdateTaskStatus(TASKS_FILE, task, statusOf(task))
+        except TaskFileError as error:  # never let bookkeeping hide the run's results
+            log.warning("%s", error)
+
+
+def FinalStatus(task: Task) -> str:
+    if task.blocked:  # an upstream task did not succeed; retry once it is fixed
+        return STATUS_PENDING
+    return STATUS_DONE if task.ok else STATUS_FAILED
+
+
+def SettleEarlierTasks(allTasks: list[Task]) -> None:
+    """Tasks outside this run count as finished for "after:" waits: done ones succeeded, the others did not."""
+    for task in allTasks:
+        if task.status == STATUS_PENDING:
+            continue
+        task.finished = True
+        if task.status != STATUS_DONE:
+            task.error = f"status [{task.status}] in TASKS.md, not done"
+        task.doneEvent.set()
+
+
+def RemoveWorkspaces(tasks: list[Task], ctx) -> None:
+    for part in (part for task in tasks for part in task.parts):  # branches and stashes survive
+        if part.kind == "code" and part.worktree:
+            gitops.RemoveWorktree(ctx.repoRoot, part.worktree)
+    shutil.rmtree(ctx.worktreeDir, ignore_errors=True)  # sys sandboxes and the system snapshot
+
+
+def RecordResults(tasks: list[Task], log: logging.Logger) -> None:
+    for task in tasks:
+        if task.status != STATUS_DONE or not task.resultRef:
+            continue
+        try:
+            RecordResult(TASKS_FILE, task)
+        except TaskFileError as error:
+            log.warning("%s", error)
+
+
+async def RunPipeline(tasks: list[Task], allTasks: list[Task], args: argparse.Namespace, parallel: int, reason: str) -> int:
+    from merge import ApplySystemTasks
+    from pipeline import RunTask
+    from report import WriteRunSummary
+    from sandbox import CreateSnapshot
+
+    ctx = CreateContext(args, parallel)
+    ctx.log.info("%d task(s), up to %d concurrent agent(s) (%s)", len(tasks), parallel, reason)
+    SettleEarlierTasks(allTasks)
+    MarkTasks(tasks, lambda task: STATUS_RUNNING, ctx.log)
+    if any(task.kind == "sys" for task in tasks):
+        ctx.systemBase = CreateSnapshot(PROJECT_ROOT, ctx.worktreeDir / "_base")
+    completed = False
+    try:
+        # Successful sys tasks are marked only once applied, after every other task is done
+        finish = lambda task: None if task.kind == "sys" and task.ok else MarkTasks([task], FinalStatus, ctx.log)
+        await asyncio.gather(*(RunTask(task, ctx, args.max_rounds, finish) for task in tasks))
+        ApplySystemTasks(tasks, ctx, lambda task: MarkTasks([task], FinalStatus, ctx.log))
+        completed = True
+    finally:
+        RemoveWorkspaces(tasks, ctx)
+        # Aborted runs (and sys tasks never applied) go back to pending so the next run picks them up again
+        MarkTasks([task for task in tasks if task.status == STATUS_RUNNING], lambda task: STATUS_PENDING, ctx.log)
+        RecordResults(tasks, ctx.log)
+        print(WriteRunSummary(tasks, ctx, completed))
+    return 0 if all(task.ok for task in tasks) else 1
+
+
+def Main(argv: list[str] | None = None) -> int:
+    ConfigureOutput()
+    args = ParseArgs(argv)
+    try:
+        allTasks = ParseTasks(TASKS_FILE)
+    except TaskFileError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 2
+    pending = [task for task in allTasks if task.status == STATUS_PENDING]
+    # A missing ref stops the run: the agent would otherwise guess at another file
+    errors = LinkDependencies(allTasks) + [error for task in pending for error in ResolveRefs(task, PROJECT_ROOT)]
+    for error in errors:
+        print(f"error: {error}", file=sys.stderr)
+    if errors:
+        return 2
+    for notice in StaleNotices(allTasks, PROJECT_ROOT):  # informational: rebuilding is the user's call
+        print(f"notice: {notice}")
+    if not pending:
+        print(f"No pending tasks in {TASKS_FILE}")
+        return 0
+    WarnMissingRoles(pending)
+    parallel, reason = ResolveParallel(args, pending)
+    if args.command == "preview":
+        PrintPlan(pending, args, parallel, reason)
+        return 0
+    return asyncio.run(RunPipeline(pending, allTasks, args, parallel, reason))
+
+
+if __name__ == "__main__":
+    sys.exit(Main())

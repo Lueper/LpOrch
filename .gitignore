@@ -1,0 +1,28 @@
+# Claude Code - local/personal files (do not commit)
+.claude/settings.local.json
+.claude/hooks/*.log
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# MCP config holds plaintext API tokens
+.mcp.json
+
+# Agent orchestrator: run artifacts and worktrees (the code in .orch/ is tracked)
+.orch/runs/
+.orch/worktrees/
+.venv/
+__pycache__/
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# IDE
+.vscode/settings.json
+.idea/
+*.swp
+*.swo

@@ -1,0 +1,119 @@
+{
+  "permissions": {
+    "allow": [
+      "Read",
+      "Glob",
+      "Grep",
+      "Edit",
+      "Write",
+      "Bash",
+      "Agent",
+      "WebFetch",
+      "WebSearch",
+      "mcp__context7__*",
+      "mcp__sequential-thinking__*",
+      "mcp__notion__*",
+      "mcp__notebooklm__*"
+    ],
+    "deny": [
+      "Bash(rm -rf /)",
+      "Bash(rm -rf /*)",
+      "Bash(rm -rf .)",
+      "Bash(rm -rf ~*)",
+      "Bash(*drop table*)",
+      "Bash(*drop database*)",
+      "Bash(*truncate table*)",
+      "Bash(git push --force*)",
+      "Bash(git push -f*)",
+      "Bash(git reset --hard*)",
+      "Bash(git clean -fd*)",
+      "Bash(git checkout -- .)",
+      "Bash(git branch -D*)",
+      "Bash(*shutdown*)",
+      "Bash(*reboot*)",
+      "Bash(*format*C:*)",
+      "Bash(*> /dev/null 2>&1 &*)",
+      "Bash(*curl*| bash*)",
+      "Bash(*wget*| bash*)",
+      "Bash(*pip install*--break-system*)"
+    ]
+  },
+
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/protect-files.sh\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell.exe -NoProfile -Command \"Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.MessageBox]::Show('Claude Code needs your attention', 'Claude Code', 'OK', 'Information')\"",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  },
+
+  "_inactive_hooks": {
+    "_description": "Move items into 'hooks' section under the matching event key to activate",
+
+    "SessionStart": [
+      {
+        "matcher": "compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cat \"$CLAUDE_PROJECT_DIR/.claude/hooks/reinject-context.txt\"",
+            "_requires": "create .claude/hooks/reinject-context.txt"
+          }
+        ]
+      }
+    ],
+
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "jq -r '.tool_input.file_path' | xargs npx prettier --write",
+            "timeout": 30,
+            "_requires": "npm install -D prettier"
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "jq -c '{timestamp: now | todate, command: .tool_input.command, exit_code: .tool_result.exit_code}' >> \"$CLAUDE_PROJECT_DIR/.claude/hooks/bash-commands.log\""
+          }
+        ]
+      }
+    ],
+
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "prompt",
+            "prompt": "Check if all requested tasks are complete. Return {\"ok\": true} if done, {\"ok\": false, \"reason\": \"what remains\"} otherwise."
+          }
+        ]
+      }
+    ]
+  }
+}
