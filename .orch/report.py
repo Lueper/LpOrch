@@ -155,11 +155,18 @@ def WriteRunSummary(tasks: list[Task], ctx: RunContext, completed: bool) -> str:
         "|---|---|---|---|---|---|---|---|",
         *(PartRow(part) for task in tasks for part in task.parts),
         "",
+        *ReportLines(tasks),
         f"Total: ${sum(task.totalCostUsd for task in tasks):.3f}",
     ]
     text = "\n".join(lines) + "\n"
     (ctx.runDir / "summary.md").write_text(text, encoding="utf-8")
     return text
+
+
+def ReportLines(tasks: list[Task]) -> list[str]:
+    """Where each code task's Korean progress report went; none for blocked tasks or aborted runs."""
+    reports = [f"- {task.id}: {task.reportRef}" for task in tasks if task.reportRef]
+    return ["Progress reports (Korean):", *reports, ""] if reports else []
 
 
 # ---------- history for later tasks ----------

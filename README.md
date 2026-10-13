@@ -58,7 +58,7 @@ pip install -r .orch/requirements.txt
 
    Claude Code 안에서는 `/orch`, `/orch preview`로도 실행 가능함.
 
-4. 결과 확인 — `doc/[Txx]_<날짜>_<제목>.md`, `git diff --cached`(code), `.orch/runs/<run-id>/summary.md`
+4. 결과 확인 — `doc/[Txx]_<날짜>_<제목>.md`, `git diff --cached`(code), `report/[Txx]_<날짜>_<제목>.md`(code Task별 진행 보고), `.orch/runs/<run-id>/summary.md`
 
 ## TASKS.md 작성법
 
@@ -112,6 +112,7 @@ pip install -r .orch/requirements.txt
 - `doc` → `doc/[Txx]_<YYMMDD>_<제목>.md` (1작업당 1문서)
 - `code` → 워킹 트리에 staged 변경 (`git diff --cached`로 리뷰)
 - `sys` → 시스템 파일에 직접 적용, 원본 백업은 `.orch/runs/<run-id>/<Txx>/backup/`, 전체 diff는 `sys.diff`
+- 진행 보고 → 실행된 code Task마다 `report/[Txx]_<YYMMDD>_<제목>.md` 생성 (doc/sys Task는 생성 안 함). run 종료 시 haiku가 run 기록(`run.log`, `notes`/`review`/`response`/`checks`, 변경 파일)을 읽고 개요·진행 경과·작업 내용·리뷰 지적사항 및 처리 결과·후속 조치를 한국어로 정리함 (요약 실패 시 원자료를 그대로 기록, `after:` 선행 실패로 blocked된 Task는 제외)
 - 로그/리뷰/요약 → `.orch/runs/<run-id>/summary.md`에서 작업별 상태·파트 수·리뷰 결과·비용 확인 가능
 
 ## 디렉터리 구조
@@ -119,18 +120,20 @@ pip install -r .orch/requirements.txt
 ```
 .
 ├── orch.bat              # orch 실행 런처 (PowerShell: .\orch)
-├── orch-reset.bat         # doc/*.md, 런 로그, TASKS.md 작업 목록 초기화
+├── orch-reset.bat         # doc/*.md, report/*.md, 런 로그, TASKS.md 작업 목록 초기화
 ├── TASKS.md               # 작업 목록 (사람이 직접 작성)
 ├── CLAUDE.md              # Claude Code 전역 규칙
 ├── doc/                   # doc 작업 결과물
+├── report/                # code Task별 진행 보고
 ├── .orch/                 # 오케스트레이터 본체 (Python)
 │   ├── orchestrate.py     # 진입점
 │   ├── phases.py / pipeline.py / review.py / merge.py  # Plan-Work-Review-Merge 파이프라인
 │   ├── planning.py        # mode: full Part 분할
+│   ├── progress.py        # Task별 한국어 진행 보고 생성
 │   ├── capacity.py        # 자동 병렬 수 결정
 │   ├── gitops.py          # code 작업용 git worktree 관리
 │   ├── sandbox.py         # sys 작업용 샌드박스 관리
-│   ├── prompts/           # 역할별(worker/reviewer/merger/namer) 프롬프트
+│   ├── prompts/           # 역할별(worker/reviewer/merger/namer/reporter) 프롬프트
 │   └── runs/              # 실행별 로그/리뷰/요약 (git에는 미포함)
 └── .claude/
     ├── settings.json      # 권한(allow/deny), 안전 훅 설정

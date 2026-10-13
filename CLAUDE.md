@@ -19,7 +19,7 @@
 - Concise — answer first, explain only if needed
 - Use structured format — bullet points, tables, code blocks
 - Context-aware — adjust detail level based on content complexity
-- **All .md files MUST be written in English** (except content that can only be expressed in Korean, e.g., Korean-specific examples in CLAUDE.md tone rules, and orchestrator doc deliverables `doc/[Txx]_*.md`, which follow the task's output language — see Orchestrated Agent Rules)
+- **All .md files MUST be written in English** (except content that can only be expressed in Korean, e.g., Korean-specific examples in CLAUDE.md tone rules, orchestrator doc deliverables `doc/[Txx]_*.md`, which follow the task's output language — see Orchestrated Agent Rules, and orchestrator progress reports `report/[Txx]_*.md`, which are Korean)
 - **Plan files MUST be written in Korean** — plans are for user communication, not code documentation
 
 ### 3. Workflow

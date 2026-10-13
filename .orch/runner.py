@@ -27,6 +27,7 @@ ROLE_TOOLS = {
     "code-merger": [*READ_TOOLS, "Edit"],
     "planner": READ_TOOLS,  # may look at the project to split along real files or sections
     "namer": [],  # answers from the prompt alone
+    "reporter": [],  # summarizes the run's records, all of which are in the prompt
 }
 WRITE_ROLES = {"code-worker", "sys-worker", "code-merger"}
 # Tool input keys worth echoing in progress lines, in priority order

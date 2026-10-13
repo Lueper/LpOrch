@@ -132,10 +132,10 @@ def SanitizeTitle(title: str) -> str:
     return cleaned[:MAX_TITLE_CHARS].rstrip("._")
 
 
-def DocPath(task: Task, ctx: RunContext, title: str) -> Path:
-    """doc/[Txx]_<YYMMDD>_<title>.md; never overwrites - adds _2, _3, ... when the name is taken."""
+def DocPath(task: Task, ctx: RunContext, title: str, dirName: str = DOC_DIR_NAME) -> Path:
+    """<dirName>/[Txx]_<YYMMDD>_<title>.md (doc/ by default); never overwrites - adds _2, _3, ... when the name is taken."""
     stem = f"[{task.id}]_{ctx.runId[2:8]}_{title}"  # runId is YYYYMMDD-HHMMSS
-    docDir = ctx.projectDir / DOC_DIR_NAME
+    docDir = ctx.projectDir / dirName  # progress reports go to their own folder (progress.py)
     path, counter = docDir / f"{stem}.md", 2
     while path.exists():
         path, counter = docDir / f"{stem}_{counter}.md", counter + 1

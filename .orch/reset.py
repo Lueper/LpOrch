@@ -3,8 +3,9 @@
 Usage (via the launcher at the project root):
     orch-reset           list what will be deleted and ask first     (PowerShell: .\\orch-reset)
     orch-reset --yes     delete without asking
-Deletes permanently: doc/*.md (subfolders such as doc/refs/ are kept), .orch/runs/*, .orch/worktrees/*,
-.orch/__pycache__, and the task list of TASKS.md (from the first task line on; the header comment stays).
+Deletes permanently: doc/*.md (subfolders such as doc/refs/ are kept), report/*.md, .orch/runs/*,
+.orch/worktrees/*, .orch/__pycache__, and the task list of TASKS.md (from the first task line on; the header
+comment stays).
 """
 from __future__ import annotations
 
@@ -19,6 +20,7 @@ ORCH_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = ORCH_DIR.parent
 TASKS_FILE = PROJECT_ROOT / "TASKS.md"
 DOC_DIR = PROJECT_ROOT / "doc"
+REPORT_DIR = PROJECT_ROOT / "report"  # progress reports of code tasks (progress.py)
 RUNS_DIR = ORCH_DIR / "runs"
 WORKSPACE_DIR = ORCH_DIR / "worktrees"
 CACHE_DIR = ORCH_DIR / "__pycache__"
@@ -41,17 +43,23 @@ def RunDirs() -> list[Path]:
     return sorted(path for path in RUNS_DIR.iterdir() if path.is_dir()) if RUNS_DIR.is_dir() else []
 
 
+def Documents(folder: Path) -> list[Path]:
+    """The folder's own .md files; subfolders are left alone."""
+    return list(folder.glob("*.md")) if folder.is_dir() else []
+
+
 def Plan(lines: list[str]) -> dict[str, int]:
     tasks = [line for line in lines[TaskListStart(lines):] if TASK_PATTERN.match(line.rstrip("\r\n"))]
     return {
-        "documents in doc/": len(list(DOC_DIR.glob("*.md"))) if DOC_DIR.is_dir() else 0,
+        "documents in doc/": len(Documents(DOC_DIR)),
+        "progress reports in report/": len(Documents(REPORT_DIR)),
         "run logs in .orch/runs/": len(RunDirs()),
         "tasks in TASKS.md": len(tasks),
     }
 
 
 def Reset(lines: list[str]) -> None:
-    for document in DOC_DIR.glob("*.md") if DOC_DIR.is_dir() else []:
+    for document in Documents(DOC_DIR) + Documents(REPORT_DIR):
         document.unlink()
     for path in RunDirs():
         shutil.rmtree(path)
@@ -78,7 +86,7 @@ def Main(argv: list[str] | None = None) -> int:
     print("This permanently deletes:")
     for label, count in plan.items():
         print(f"  {count:>3} {label}")
-    print("  (kept: .orch code and prompts, .claude/, CLAUDE.md, the TASKS.md header, folders inside doc/)")
+    print("  (kept: .orch code and prompts, .claude/, CLAUDE.md, the TASKS.md header, folders inside doc/ and report/)")
     if not args.yes and input("Delete? [y/N] ").strip().lower() not in ("y", "yes"):
         print("Cancelled.")
         return 1

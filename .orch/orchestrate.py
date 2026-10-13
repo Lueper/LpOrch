@@ -1,6 +1,7 @@
 """Agent orchestrator: every TASKS.md task runs on its own - work -> fresh review -> revision -> result.
 "mode: full" tasks use the multi-agent pipeline (plan -> parallel parts -> ring review -> merge -> integration review).
 Tasks with "after:" wait for those tasks; [sys] tasks change the orchestrator itself and are applied at the end.
+When the run ends, every code task that ran gets a Korean progress report in report/ (progress.py).
 
 Lives in <project>/.orch/ and always works on <project>, the folder that contains .orch/.
 Usage (via the launcher at the project root):
@@ -205,6 +206,7 @@ def RecordResults(tasks: list[Task], log: logging.Logger) -> None:
 async def RunPipeline(tasks: list[Task], allTasks: list[Task], args: argparse.Namespace, parallel: int, reason: str) -> int:
     from merge import ApplySystemTasks
     from pipeline import RunTask
+    from progress import WriteProgressReports
     from report import WriteRunSummary
     from sandbox import CreateSnapshot
 
@@ -221,6 +223,7 @@ async def RunPipeline(tasks: list[Task], allTasks: list[Task], args: argparse.Na
         await asyncio.gather(*(RunTask(task, ctx, args.max_rounds, finish) for task in tasks))
         ApplySystemTasks(tasks, ctx, lambda task: MarkTasks([task], FinalStatus, ctx.log))
         completed = True
+        await WriteProgressReports(tasks, ctx)  # every task is final now, [sys] applies included
     finally:
         RemoveWorkspaces(tasks, ctx)
         # Aborted runs (and sys tasks never applied) go back to pending so the next run picks them up again

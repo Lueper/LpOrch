@@ -36,11 +36,13 @@ A task whose "after:" task did not succeed stays [ ] (blocked) and runs again ne
 
 Run:      orch            (PowerShell: .\orch)    or /orch in Claude Code
 Preview:  orch preview    (PowerShell: .\orch preview)
-Reset:    orch-reset      (PowerShell: .\orch-reset)  permanently deletes doc/*.md, run logs and this task
-          list (the header stays) after showing counts and asking; "orch-reset --yes" skips the question
+Reset:    orch-reset      (PowerShell: .\orch-reset)  permanently deletes doc/*.md, report/*.md, run logs and
+          this task list (the header stays) after showing counts and asking; "orch-reset --yes" skips the question
 Results:  docs -> doc/[Txx]_<YYMMDD>_<Korean title>.md (one document per task)
           code -> staged, uncommitted changes per task (review with git diff --cached)
           sys  -> applied to the system files; originals in .orch/runs/<run-id>/<Txx>/backup/
+          progress report -> report/[Txx]_<YYMMDD>_<title>.md for every code task that ran (Korean:
+                  timeline, review findings and how they were handled, follow-ups)
           logs, reviews, summary -> .orch/runs/<run-id>/
 -->
 
