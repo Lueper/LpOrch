@@ -6,6 +6,7 @@ Every task runs this concurrently; a task with "after:" waits for those tasks an
 """
 from __future__ import annotations
 
+import asyncio
 import traceback
 from typing import Callable
 
@@ -27,12 +28,14 @@ async def RunTask(task: Task, ctx: RunContext, maxRounds: int, onFinished: Calla
         else:
             await RunTaskPhases(task, ctx, maxRounds)
             task.resultRun = ctx.runId  # recorded with the result: later tasks read this run's reviews
+    except asyncio.CancelledError:  # the run was aborted: the task stays unfinished, so it is reported and reset as pending
+        task.doneEvent.set()
+        raise
     except Exception as error:  # one task's crash must not stop the others
         task.error = f"{type(error).__name__}: {error}"
         ctx.log.debug("[%s] crashed:\n%s", task.id, traceback.format_exc())
-    finally:
-        task.finished = True
-        task.doneEvent.set()  # release downstream tasks even if this one crashed
+    task.finished = True
+    task.doneEvent.set()  # release downstream tasks even if this one crashed
     outcome = "BLOCKED" if task.blocked else "FAILED"
     ctx.log.info("[%s] %s", task.id, f"done -> {task.result}" if task.ok else f"{outcome} - {task.error}")
     onFinished(task)  # mark TASKS.md right away instead of waiting for the slowest task

@@ -7,8 +7,10 @@ Lives in <project>/.orch/ and always works on <project>, the folder that contain
 Usage (via the launcher at the project root):
     orch                 run the pending tasks in TASKS.md      (PowerShell: .\\orch)
     orch preview         show tasks, reviewer pairs and the agent count without running anything
-Options: [--max-parallel N] [--max-rounds 1] [--budget-per-agent 2.0] [--max-turns 40]
-         [--model NAME] [--cli-path PATH/TO/claude.exe]
+Options: [--max-parallel N] [--max-rounds N] [--budget-per-agent USD] [--max-turns N]
+         [--provider claude|gemini] [--model NAME] [--cli-path PATH/TO/claude.exe]
+Their defaults, and the provider and model of each agent role, come from orch.toml at the project root (config.py);
+options given here win over the file.
 """
 from __future__ import annotations
 
@@ -22,6 +24,7 @@ from pathlib import Path
 
 import gitops
 from capacity import AutoParallel
+from config import PROVIDERS, AgentSummary, LoadConfig, OrchConfig, Problems, UsesProvider
 from context import RefLabel, RefTasks, ResolveRefs, ResultFiles, StaleNotices
 from taskfile import LinkDependencies, ParseTasks, RecordResult, UpdateTaskStatus
 from tasks import MAX_PARTS, STATUS_DONE, STATUS_FAILED, STATUS_PENDING, STATUS_RUNNING, Task, TaskFileError
@@ -33,20 +36,40 @@ ROLE_SKILL_DIR = PROJECT_ROOT / ".claude" / "skills" / "develop"
 MAX_LISTED_REFS = 5  # preview lists this many ref entries per task
 
 
-def ParseArgs(argv: list[str] | None) -> argparse.Namespace:
+def ParseArgs(argv: list[str] | None, config: OrchConfig) -> argparse.Namespace:
+    # Defaults come from orch.toml (or the built-in values), so --help shows what a run would use;
+    # ranges are checked once on the final values (config.Problems)
     parser = argparse.ArgumentParser(prog="orch", description="Run TASKS.md through parallel work, review and merge.")
     parser.add_argument("command", nargs="?", choices=["run", "preview"], default="run", help="default: run")
-    parser.add_argument("--max-parallel", type=int, default=None, help="override the automatic agent count")
-    parser.add_argument("--max-rounds", type=int, default=1, help="review/revise rounds (0 = no review)")
-    parser.add_argument("--budget-per-agent", type=float, default=2.0, help="USD cap per agent call")
-    parser.add_argument("--max-turns", type=int, default=40, help="turn cap per agent call")
-    parser.add_argument("--model", default=None, help="model alias or ID (default: CLI default)")
-    parser.add_argument("--cli-path", default=None, help="native claude executable (auto-detected for npm installs)")
-    args = parser.parse_args(argv)
-    invalidParallel = args.max_parallel is not None and args.max_parallel < 1
-    if invalidParallel or args.max_rounds < 0 or args.budget_per_agent <= 0 or args.max_turns < 1:
-        parser.error("--max-parallel/--max-turns must be >= 1, --max-rounds >= 0, --budget-per-agent > 0")
-    return args
+    parser.add_argument(
+        "--max-parallel", type=int, default=config.maxParallel, help="concurrent agents, 0 = automatic (default: %(default)s)"
+    )
+    parser.add_argument(
+        "--max-rounds", type=int, default=config.maxRounds, help="review/fix rounds, 0 = no review (default: %(default)s)"
+    )
+    parser.add_argument(
+        "--budget-per-agent", type=float, default=config.budgetPerAgent, help="USD cap per agent call (default: %(default)s)"
+    )
+    parser.add_argument("--max-turns", type=int, default=config.maxTurns, help="turn cap per agent call (default: %(default)s)")
+    parser.add_argument(
+        "--provider", choices=PROVIDERS, default=config.provider,
+        help="provider of every role without its own in orch.toml [roles.*] (default: %(default)s)",
+    )
+    parser.add_argument("--model", default=None, help="model alias or ID for that provider (default: orch.toml, else CLI default)")
+    parser.add_argument("--cli-path", default=None, help="native claude executable (default: orch.toml, else auto-detected)")
+    return parser.parse_args(argv)
+
+
+def ApplyArgs(config: OrchConfig, args: argparse.Namespace) -> OrchConfig:
+    """Command-line options over orch.toml; the file's [roles.*] overrides still apply."""
+    config.maxParallel, config.maxRounds = args.max_parallel, args.max_rounds
+    config.budgetPerAgent, config.maxTurns = args.budget_per_agent, args.max_turns
+    config.provider = args.provider
+    if args.model is not None:
+        config.providers[config.provider].model = args.model.strip() or None
+    if args.cli_path is not None:
+        config.providers["claude"].cliPath = args.cli_path.strip() or None
+    return config
 
 
 def ConfigureOutput() -> None:
@@ -58,10 +81,10 @@ def ConfigureOutput() -> None:
             stream.reconfigure(encoding="utf-8", errors="replace")
 
 
-def ResolveParallel(args: argparse.Namespace, tasks: list[Task]) -> tuple[int, str]:
+def ResolveParallel(config: OrchConfig, tasks: list[Task]) -> tuple[int, str]:
     """Global cap on concurrent agents across all tasks (one per standard task, up to MAX_PARTS per full task)."""
-    if args.max_parallel:
-        return args.max_parallel, "set by --max-parallel"
+    if config.maxParallel:
+        return config.maxParallel, "set by max_parallel"
     return AutoParallel(sum(MAX_PARTS if task.full else 1 for task in tasks))
 
 
@@ -71,12 +94,18 @@ def WarnMissingRoles(tasks: list[Task]) -> None:
             print(f"warning: {task.id} role skill '{task.role}' not found in {ROLE_SKILL_DIR}; running without it")
 
 
-def PrintPlan(tasks: list[Task], args: argparse.Namespace, parallel: int, reason: str) -> None:
+def PrintPlan(tasks: list[Task], config: OrchConfig, parallel: int, reason: str) -> None:
     print(f"{len(tasks)} pending task(s) in {TASKS_FILE} - each runs independently and yields its own result")
     print("standard tasks: 1 agent -> fresh review -> revision (verified only after CRITICAL findings)")
     if any(task.full for task in tasks):
         print(f"mode: full tasks: planner splits into 1-{MAX_PARTS} parts, ring review, merge + integration review")
-    print(f"concurrent agents (all tasks): {parallel} ({reason}); review/revise rounds: {args.max_rounds}")
+    print(f"concurrent agents (all tasks): {parallel} ({reason}); review/fix rounds: {config.maxRounds}")
+    # Which settings file applied and which provider/model each role runs on
+    print(f"settings: {config.source}; per agent call: ${config.budgetPerAgent:g} cap, {config.maxTurns} turns")
+    for line in AgentSummary(config):
+        print(f"agents: {line}")
+    if UsesProvider(config, "gemini"):  # what differs from Claude agents (gemini.py)
+        print("gemini: cost not reported ($0 in the summary, tokens in run.log); max_turns applies, budget_per_agent does not")
     if any(task.kind == "code" for task in tasks):
         repo = gitops.ResolveRepo(PROJECT_ROOT)
         print(f"git: {repo[0]} @ {repo[1][:8]}" if repo else "git: NOT a repo with commits - code tasks will fail")
@@ -137,7 +166,7 @@ def CreateLogger(runDir: Path) -> logging.Logger:
     return logger
 
 
-def CreateContext(args: argparse.Namespace, parallel: int):
+def CreateContext(config: OrchConfig, parallel: int):
     from runner import ResolveCliPath, RunContext  # lazy: keeps `preview` free of the SDK dependency
 
     runId = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -152,12 +181,10 @@ def CreateContext(args: argparse.Namespace, parallel: int):
         repoRoot=repoRoot,
         worktreeDir=ORCH_DIR / "worktrees" / runId,
         baseCommit=baseCommit,
-        budgetPerAgent=args.budget_per_agent,
-        maxTurns=args.max_turns,
-        model=args.model,
+        config=config,
         log=CreateLogger(runDir),
         semaphore=asyncio.Semaphore(parallel),
-        cliPath=ResolveCliPath(args.cli_path),
+        cliPath=ResolveCliPath(config.providers["claude"].cliPath),
     )
 
 
@@ -203,15 +230,17 @@ def RecordResults(tasks: list[Task], log: logging.Logger) -> None:
             log.warning("%s", error)
 
 
-async def RunPipeline(tasks: list[Task], allTasks: list[Task], args: argparse.Namespace, parallel: int, reason: str) -> int:
+async def RunPipeline(tasks: list[Task], allTasks: list[Task], config: OrchConfig, parallel: int, reason: str) -> int:
     from merge import ApplySystemTasks
     from pipeline import RunTask
     from progress import WriteProgressReports
     from report import WriteRunSummary
     from sandbox import CreateSnapshot
 
-    ctx = CreateContext(args, parallel)
+    ctx = CreateContext(config, parallel)
     ctx.log.info("%d task(s), up to %d concurrent agent(s) (%s)", len(tasks), parallel, reason)
+    for line in AgentSummary(config):  # run.log records which provider/model each role ran on
+        ctx.log.info("agents: %s", line)
     SettleEarlierTasks(allTasks)
     MarkTasks(tasks, lambda task: STATUS_RUNNING, ctx.log)
     if any(task.kind == "sys" for task in tasks):
@@ -220,7 +249,7 @@ async def RunPipeline(tasks: list[Task], allTasks: list[Task], args: argparse.Na
     try:
         # Successful sys tasks are marked only once applied, after every other task is done
         finish = lambda task: None if task.kind == "sys" and task.ok else MarkTasks([task], FinalStatus, ctx.log)
-        await asyncio.gather(*(RunTask(task, ctx, args.max_rounds, finish) for task in tasks))
+        await asyncio.gather(*(RunTask(task, ctx, config.maxRounds, finish) for task in tasks))
         ApplySystemTasks(tasks, ctx, lambda task: MarkTasks([task], FinalStatus, ctx.log))
         completed = True
         await WriteProgressReports(tasks, ctx)  # every task is final now, [sys] applies included
@@ -235,7 +264,14 @@ async def RunPipeline(tasks: list[Task], allTasks: list[Task], args: argparse.Na
 
 def Main(argv: list[str] | None = None) -> int:
     ConfigureOutput()
-    args = ParseArgs(argv)
+    config, errors = LoadConfig(PROJECT_ROOT)
+    if not errors:  # the file supplies the option defaults, so it is read before the command line
+        args = ParseArgs(argv, config)
+        errors = Problems(ApplyArgs(config, args))
+    for error in errors:
+        print(f"error: {error}", file=sys.stderr)
+    if errors:
+        return 2
     try:
         allTasks = ParseTasks(TASKS_FILE)
     except TaskFileError as error:
@@ -254,11 +290,11 @@ def Main(argv: list[str] | None = None) -> int:
         print(f"No pending tasks in {TASKS_FILE}")
         return 0
     WarnMissingRoles(pending)
-    parallel, reason = ResolveParallel(args, pending)
+    parallel, reason = ResolveParallel(config, pending)
     if args.command == "preview":
-        PrintPlan(pending, args, parallel, reason)
+        PrintPlan(pending, config, parallel, reason)
         return 0
-    return asyncio.run(RunPipeline(pending, allTasks, args, parallel, reason))
+    return asyncio.run(RunPipeline(pending, allTasks, config, parallel, reason))
 
 
 if __name__ == "__main__":

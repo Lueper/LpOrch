@@ -224,7 +224,8 @@ async def RunRevision(part: Part, ctx: RunContext) -> bool:
     checkpoint = await asyncio.to_thread(sandbox.Checkpoint, part.worktree) if part.kind == "sys" else None
     intro = f"A reviewer ({review['reviewer']}) reviewed your output for part {part.id}."
     checks = CheckText(part) if part.checkOk is False else ""
-    result = await RunAgent(f"{part.id} revise r{review['round']}", RevisionRequest(intro, review, checks, part.kind), spec, ctx)
+    # "fix", not "revise": next to "review" in the log the two read alike
+    result = await RunAgent(f"{part.id} fix r{review['round']}", RevisionRequest(intro, review, checks, part.kind), spec, ctx)
     part.costUsd += result.costUsd
     if not result.ok:  # keep the last good output; the part itself still counts as done
         part.notes.append(f"revision r{review['round']} failed: {result.error}")

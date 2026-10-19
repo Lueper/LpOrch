@@ -86,7 +86,10 @@ def Main(argv: list[str] | None = None) -> int:
     print("This permanently deletes:")
     for label, count in plan.items():
         print(f"  {count:>3} {label}")
-    print("  (kept: .orch code and prompts, .claude/, CLAUDE.md, the TASKS.md header, folders inside doc/ and report/)")
+    print(
+        "  (kept: .orch code and prompts, .claude/, CLAUDE.md, orch.toml, the TASKS.md header,"
+        " folders inside doc/ and report/)"
+    )
     if not args.yes and input("Delete? [y/N] ").strip().lower() not in ("y", "yes"):
         print("Cancelled.")
         return 1

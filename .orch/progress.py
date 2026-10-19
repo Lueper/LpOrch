@@ -1,5 +1,6 @@
 """Korean progress report per code task: what the run recorded about a task - timeline, worker summaries, reviews,
-the author's responses, checks and changed files - summarized by a cheap model once every task is final.
+the author's responses, checks and changed files - summarized by the provider's small_model (orch.toml) once every
+task is final.
 
 Written to report/[Txx]_<YYMMDD>_<title>.md, apart from the doc deliverables; doc and sys tasks get none, and
 neither do tasks blocked by "after:" (they did not run). When the model gives no report, the recorded facts are
@@ -17,7 +18,6 @@ from report import ROUND_NUMBER, CheckState, ReviewState, TaskStatus
 from runner import AgentSpec, LoadPrompt, RunAgent, RunContext, WriteText
 from tasks import Part, Task
 
-REPORTER_MODEL = "haiku"  # summarizing and translating recorded facts; the cheapest model is enough
 REPORT_DIR_NAME = "report"  # kept apart from doc/, which holds the doc deliverables
 REPORT_KINDS = ("code",)  # doc tasks are their own record; sys changes are backed up and diffed in the run folder
 MAX_ARTIFACT_CHARS = 8_000  # per artifact; the full files stay in the run folder
@@ -37,7 +37,7 @@ async def WriteProgressReports(tasks: list[Task], ctx: RunContext) -> None:
 async def WriteProgressReport(task: Task, ctx: RunContext) -> None:
     try:
         facts = FactSheet(task, ctx)
-        spec = AgentSpec(role="reporter", cwd=ctx.runDir, systemAppend=LoadPrompt("reporter"), model=REPORTER_MODEL)
+        spec = AgentSpec(role="reporter", cwd=ctx.runDir, systemAppend=LoadPrompt("reporter"))  # small_model
         result = await RunAgent(f"{task.id} report", facts, spec, ctx)
         task.costUsd += result.costUsd
         report = result.text if result.ok and result.text.strip() else RawReport(task, facts, result.error or "empty reply")

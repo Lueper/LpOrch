@@ -9,7 +9,7 @@ each other, every revision is re-checked, and the merged result is reviewed agai
 
   - [ ] [doc] <title>           research / writing / analysis -> Markdown deliverable
   - [ ] [code] <title>          code change in an isolated git worktree (the project must be a git repo)
-  - [ ] [sys] <title>           change this orchestrator itself (.orch/, .claude/, CLAUDE.md, TASKS.md, orch*.bat)
+  - [ ] [sys] <title>           change this orchestrator itself (.orch/, .claude/, CLAUDE.md, TASKS.md, orch.toml, orch*.bat)
                                 in a sandbox copy; applied automatically when the run ends, only if the
                                 automated checks (compile, import, preview, JSON) and reviews pass
   - [ ] [<kind>:<role>] <title> also injects .claude/skills/develop/<role>.md when that file exists

@@ -68,8 +68,8 @@ def ReviewState(subject: Subject) -> str:
     if last.get("verdict") == "error":
         return "review error"
     if not NeedsRevision(last):
-        return "approved" if subject.revisions == 0 else "approved after revision"
-    return "revised, not re-reviewed" if subject.revisions >= last["round"] else "changes requested"
+        return "approved" if subject.revisions == 0 else "approved after fix"
+    return "fixed, not re-reviewed" if subject.revisions >= last["round"] else "changes requested"
 
 
 def OpenFindings(subject: Subject, severities: tuple[str, ...] = SEVERITIES[:2]) -> list[dict]:
@@ -147,11 +147,11 @@ def WriteRunSummary(tasks: list[Task], ctx: RunContext, completed: bool) -> str:
         f"- Project: {ctx.projectDir}",
         f"- Artifacts: {ctx.runDir}",
         "",
-        "| Task | Kind | Status | Parts | Approved | Findings C/W/I | Revisions | Integration | Checks | Cost (USD) | Result / Note |",
+        "| Task | Kind | Status | Parts | Approved | Findings C/W/I | Fixes | Integration | Checks | Cost (USD) | Result / Note |",
         "|---|---|---|---|---|---|---|---|---|---|---|",
         *(TaskRow(task) for task in tasks),
         "",
-        "| Part | Title | Review | Findings C/W/I | Revisions | Checks | Cost (USD) | Note |",
+        "| Part | Title | Review | Findings C/W/I | Fixes | Checks | Cost (USD) | Note |",
         "|---|---|---|---|---|---|---|---|",
         *(PartRow(part) for task in tasks for part in task.parts),
         "",

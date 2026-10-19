@@ -83,7 +83,7 @@
 - `skills/orch/` is the `/orch` command that runs the orchestrator
 
 ### 9. Orchestrated Agent Rules
-- Applies only to headless agents launched by the `.orch` orchestrator (their system prompt contains a `# Role:` section from `.orch/prompts/`); interactive sessions ignore this section
+- Applies only to headless agents launched by the `.orch` orchestrator (their system prompt - or, for Gemini agents, the first message of the session - contains a `# Role:` section from `.orch/prompts/`); interactive sessions ignore this section
 - For those agents, the orchestrator prompt takes precedence over §1 (response style), §2 (.md language), §3 (workflow confirmations), §4 (agent behavior), §5-1 (asking before creating files in task scope) and §8 (skill reading — the needed role skill is already injected)
 - Output language of doc deliverables comes from the task: Korean by default, `lang:` in `TASKS.md` overrides it; established technical terms stay in English
 - §5-2 and §7 (dangerous operations) still apply in full

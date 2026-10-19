@@ -29,8 +29,8 @@ Translate the recorded states with these terms:
 | Recorded | Korean |
 |---|---|
 | status `done` / `failed` / `reset to pending` | 완료 / 실패 / 중단 (대기로 복귀) |
-| review `approved` / `approved after revision` | 승인 / 수정 후 승인 |
-| review `revised, not re-reviewed` | 수정 완료 (재검증 생략) |
+| review `approved` / `approved after fix` | 승인 / 수정 후 승인 |
+| review `fixed, not re-reviewed` | 수정 완료 (재검증 생략) |
 | review `changes requested` / `review error` / `not reviewed` | 수정 요청 미해결 / 리뷰 오류 / 리뷰 미실시 |
 | checks `passed` / `FAILED` / `-` | 통과 / 실패 / 미실행 |
 
@@ -50,7 +50,7 @@ Use exactly these sections, in this order:
 - **진행 경과**: a numbered list built from the timeline, one line per agent step (작업, 리뷰, 수정, 검증, 병합, 통합 리뷰, 적용 ...): `HH:MM:SS–HH:MM:SS 단계 (role) — outcome`, merging each step's start and finish lines; the outcome is the verdict and finding counts for reviews, the cost, or the failure reason. Do not repeat the work content here.
 - **작업 내용**: what the worker did and why, from the final notes: key decisions, what each revision changed, assumptions, test or build results. Then the changed files as a list with their line counts.
 - **리뷰 지적사항 및 처리**: a table `| 라운드 | 심각도 | 위치 | 지적 내용 | 처리 결과 |` with every finding of every review round, translated into Korean. 처리 결과 comes from the author's response (`response.rN.md`) and later rounds:
-  - `수정됨` with how it was fixed, plus ` (재검증 생략)` when no later round checked the fix (the part's review state is "revised, not re-reviewed")
+  - `수정됨` with how it was fixed, plus ` (재검증 생략)` when no later round checked the fix (the part's review state is "fixed, not re-reviewed")
   - `반려` with the author's reason, when the response kept the code or text as it was (rejected, left as-is, out of scope)
   - `미처리` only when no response mentions the finding
   - Reasons in a response are the author's, not the reviewer's: attribute them to the author (작성자).

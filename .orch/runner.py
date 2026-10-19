@@ -1,4 +1,5 @@
-"""claude_agent_sdk wrapper: shared run context, role presets and prompt loading."""
+"""Agent calls: shared run context, role presets and prompt loading; each call runs on the provider orch.toml
+picks for its role - claude through claude_agent_sdk here, gemini through the Gemini CLI (gemini.py)."""
 from __future__ import annotations
 
 import asyncio
@@ -11,13 +12,15 @@ from typing import Any
 
 from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, ResultMessage, ToolUseBlock, query
 
+from config import OrchConfig
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent  # the folder that contains .orch/
 PROMPT_DIR = Path(__file__).resolve().parent / "prompts"
 SKILL_DIR = PROJECT_ROOT / ".claude" / "skills"
 FRONTMATTER = re.compile(r"\A---\r?\n.*?\r?\n---\r?\n", re.DOTALL)
 
 READ_TOOLS = ["Read", "Glob", "Grep"]
-# Each role sees only the built-in tools it needs; write access is limited to code roles
+# Each role sees only the built-in tools it needs; write access is limited to code roles (keys = config.ROLES)
 ROLE_TOOLS = {
     "doc-worker": [*READ_TOOLS, "WebSearch", "WebFetch"],
     "code-worker": [*READ_TOOLS, "Edit", "Write", "Bash"],
@@ -44,9 +47,7 @@ class RunContext:
     repoRoot: Path | None  # git root for code tasks; None when the project is not a repo
     worktreeDir: Path
     baseCommit: str | None
-    budgetPerAgent: float
-    maxTurns: int
-    model: str | None
+    config: OrchConfig  # run options and each role's provider and model (orch.toml + command line)
     log: logging.Logger
     semaphore: asyncio.Semaphore
     cliPath: str | None = None  # native claude executable; None = SDK default lookup
@@ -68,7 +69,6 @@ class AgentSpec:
     fork: bool = False
     addDirs: list[Path] = field(default_factory=list)
     outputFormat: dict | None = None
-    model: str | None = None  # per-call override, e.g. a cheap model for small chores
 
 
 @dataclass
@@ -102,11 +102,18 @@ def BuildOptions(spec: AgentSpec, ctx: RunContext, label: str) -> ClaudeAgentOpt
         resume=spec.resume,
         fork_session=spec.fork,
         output_format=spec.outputFormat,
-        max_turns=ctx.maxTurns,
-        max_budget_usd=ctx.budgetPerAgent,
-        model=spec.model or ctx.model,
+        max_turns=ctx.config.maxTurns,
+        max_budget_usd=ctx.config.budgetPerAgent,
+        model=ctx.config.AgentFor(spec.role).model,  # orch.toml: [roles.<role>], small_model, model
         cli_path=ctx.cliPath,
+        env=ClaudeEnv(ctx),
     )
+
+
+def ClaudeEnv(ctx: RunContext) -> dict[str, str]:
+    # Added to the inherited environment: API retries only when orch.toml sets [claude] max_retries
+    retries = ctx.config.providers["claude"].maxRetries
+    return {} if retries is None else {"CLAUDE_CODE_MAX_RETRIES": str(retries)}
 
 
 def ResolveCliPath(explicit: str | None) -> str | None:
@@ -136,23 +143,32 @@ def ToAgentResult(message: ResultMessage) -> AgentResult:
 
 
 async def RunAgent(label: str, prompt: str, spec: AgentSpec, ctx: RunContext) -> AgentResult:
+    choice = ctx.config.AgentFor(spec.role)
     async with ctx.semaphore:  # one global cap on concurrent agents across all phases
-        ctx.log.info("[%s] start (%s)", label, spec.role)
-        result = AgentResult(error="agent ended without a result message")
-        try:
-            async for message in query(prompt=prompt, options=BuildOptions(spec, ctx, label)):
-                if isinstance(message, AssistantMessage):
-                    LogToolUse(label, message, ctx)
-                elif isinstance(message, ResultMessage):
-                    result = ToAgentResult(message)
-        except Exception as error:  # system boundary: CLI process / transport / error-result failures
-            # Keep cost and session from a result message received before the raise (e.g. budget cap)
-            result = AgentResult(
-                error=f"{type(error).__name__}: {error}", sessionId=result.sessionId, costUsd=result.costUsd
-            )
+        ctx.log.info("[%s] start (%s on %s)", label, spec.role, choice.provider)
+        if choice.provider == "gemini":
+            from gemini import RunGemini  # lazy: gemini.py builds on this module
+
+            result = await RunGemini(label, prompt, spec, ctx, choice.model)
+        else:
+            result = await RunClaude(label, prompt, spec, ctx)
         status = "ok" if result.ok else f"failed - {result.error}"
         ctx.log.info("[%s] %s ($%.3f)", label, status, result.costUsd)
         return result
+
+
+async def RunClaude(label: str, prompt: str, spec: AgentSpec, ctx: RunContext) -> AgentResult:
+    result = AgentResult(error="agent ended without a result message")
+    try:
+        async for message in query(prompt=prompt, options=BuildOptions(spec, ctx, label)):
+            if isinstance(message, AssistantMessage):
+                LogToolUse(label, message, ctx)
+            elif isinstance(message, ResultMessage):
+                result = ToAgentResult(message)
+    except Exception as error:  # system boundary: CLI process / transport / error-result failures
+        # Keep cost and session from a result message received before the raise (e.g. budget cap)
+        result = AgentResult(error=f"{type(error).__name__}: {error}", sessionId=result.sessionId, costUsd=result.costUsd)
+    return result
 
 
 def LogToolUse(label: str, message: AssistantMessage, ctx: RunContext) -> None:

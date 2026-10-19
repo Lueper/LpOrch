@@ -1,0 +1,29 @@
+# LpOrch settings. Command-line options override these values (e.g. orch --max-rounds 2).
+# A missing key, or a missing file, keeps the built-in default shown here.
+
+[run]
+max_parallel = 0            # concurrent agents across all tasks; 0 = automatic (CPU, memory, task count)
+max_rounds = 1              # review/fix rounds per task; 0 = no review
+budget_per_agent = 2.0      # USD cap per agent call
+max_turns = 40              # turn cap per agent call
+
+[agent]
+provider = "claude"         # every role without its own provider below: claude | gemini
+
+[claude]
+model = "opus"                  # main model, alias or ID (e.g. "opus", "sonnet"); "" = the CLI's default
+small_model = "haiku"       # namer and reporter: one-shot chores; "" = same as model
+cli_path = ""               # native claude executable; "" = auto-detect (npm installs included)
+# max_retries = 10          # retries of a failed API request (429, 529, network); unset = the CLI's default (10)
+
+[gemini]
+model = ""                  # e.g. "pro", "flash"; "" = the CLI's default ("auto")
+small_model = "flash-lite"  # namer and reporter; "" = same as model
+cli_path = ""               # gemini executable or gemini.js; "" = auto-detect (npm installs included)
+max_retries = 0             # retries of a failed API request (429 quota, network), 0-9; 0 = fail at once
+
+# Per-role overrides of provider and/or model. Roles: doc-worker, code-worker, sys-worker, reviewer,
+# doc-merger, code-merger, planner, namer, reporter
+# [roles.reviewer]
+# provider = "gemini"
+# model = "pro"

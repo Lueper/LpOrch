@@ -16,7 +16,6 @@ from runner import AgentSpec, LoadPrompt, RunAgent, RunContext, WriteText
 from tasks import SYS_APPLIED_PREFIX, Part, Task
 
 DOC_DIR_NAME = "doc"
-NAMER_MODEL = "haiku"  # naming is a one-shot chore; the cheapest model is enough
 TITLE_SCHEMA = {"type": "object", "properties": {"title": {"type": "string"}}, "required": ["title"]}
 INVALID_FILENAME_CHARS = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
 MAX_TITLE_CHARS = 40
@@ -111,15 +110,14 @@ async def ReviewMergedDoc(task: Task, ctx: RunContext, maxRounds: int, content: 
 
 async def KoreanTitle(task: Task, content: str, ctx: RunContext) -> str:
     """Short Korean title for the file name; falls back to the task's own title."""
-    spec = AgentSpec(
+    spec = AgentSpec(  # a one-shot chore: runs on the provider's small_model (orch.toml)
         role="namer",
         cwd=ctx.runDir,
         systemAppend=LoadPrompt("namer"),
         outputFormat={"type": "json_schema", "schema": TITLE_SCHEMA},
-        model=NAMER_MODEL,
     )
     prompt = f"Task: {task.title}\n\nDocument (beginning):\n{content[:NAMER_INPUT_CHARS]}"
-    result = await RunAgent(f"{task.id} name", prompt, spec, ctx)
+    result = await RunAgent(f"{task.id} title", prompt, spec, ctx)  # the Korean title in the doc's file name
     task.costUsd += result.costUsd
     data = result.structured if result.ok and isinstance(result.structured, dict) else {}
     return SanitizeTitle(str(data.get("title", ""))) or SanitizeTitle(task.title) or ctx.runId

@@ -16,7 +16,7 @@ from pathlib import Path
 
 # The system a [sys] task may change
 SCOPE_DIRS = (".orch", ".claude")
-SCOPE_FILES = ("CLAUDE.md", "TASKS.md", "orch.bat", "orch-reset.bat")
+SCOPE_FILES = ("CLAUDE.md", "TASKS.md", "orch.toml", "orch.bat", "orch-reset.bat")  # orch.toml: checked by preview
 # Run artifacts, sandboxes, caches and local or secret files never enter a sandbox
 EXCLUDED_DIRS = {"runs", "worktrees", "__pycache__", ".pytest_cache", ".mypy_cache", ".venv"}
 EXCLUDED_FILES = {"settings.local.json"}

@@ -26,3 +26,8 @@ Desktop.ini
 .idea/
 *.swp
 *.swo
+
+# Output
+doc
+report
+src

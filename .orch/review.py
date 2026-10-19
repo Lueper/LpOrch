@@ -1,7 +1,7 @@
 """Review phases: ring review of a task's parts, verify-only re-review after every revision,
 and review of the integrated result of a multi-part task.
 
-Every revision is followed by a verification, so no result leaves the pipeline "revised, not re-reviewed".
+Every revision is followed by a verification, so no result leaves the pipeline "fixed, not re-reviewed".
 """
 from __future__ import annotations
 
@@ -124,11 +124,18 @@ async def ReviewTask(task: Task, ctx: RunContext, roundNo: int) -> None:
 
 
 async def RunReview(part: Part, peer: Part | None, ctx: RunContext, roundNo: int) -> None:
+    if peer and not SameProvider(ctx, "reviewer", f"{peer.kind}-worker"):
+        peer = None  # a session cannot move between providers (orch.toml [roles.*]): review fresh instead
     cwd = peer.workCwd if peer else part.workCwd  # resume must run in the session's own project dir
     spec = ReviewerSpec(part.task, cwd, PartDirs(part, ctx), resume=peer.sessionId if peer else None)
     reviewer = peer.id if peer else "fresh-reviewer"
-    result = await RunAgent(f"{part.id} review r{roundNo} by {reviewer}", ReviewPrompt(part, peer, ctx), spec, ctx)
+    byPeer = f" by {peer.id}" if peer else ""  # a fresh session is the default: only peer reviews are named
+    result = await RunAgent(f"{part.id} review r{roundNo}{byPeer}", ReviewPrompt(part, peer, ctx), spec, ctx)
     RecordReview(part, ctx, result, roundNo, reviewer, "review")
+
+
+def SameProvider(ctx: RunContext, role: str, otherRole: str) -> bool:
+    return ctx.config.AgentFor(role).provider == ctx.config.AgentFor(otherRole).provider
 
 
 def ReviewPrompt(part: Part, peer: Part | None, ctx: RunContext) -> str:
