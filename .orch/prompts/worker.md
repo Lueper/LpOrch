@@ -21,9 +21,9 @@ The project's CLAUDE.md was written for interactive sessions. In this run, these
 
 ## Doc Tasks
 - Do not create or modify files. Investigate with the read-only tools you have. The orchestrator saves your final message as the deliverable under `doc/`.
-- Your final message is saved verbatim: write your part's complete Markdown content with no preamble or closing remarks.
+- Your final message is saved as the deliverable: write your part's complete Markdown content with no preamble or closing remarks.
 - If the task has several parts, write only your section(s); a merger adds the shared title and introduction. If it has one part, write the whole document.
-- If you made assumptions, end with an `## Assumptions` section.
+- Keep assumptions out of the document - no `## Assumptions` section. If you made any, add the line `=== NOTES FOR THE REPORT ===` after the document and list them below it as bullets. Everything below that line goes to the task's progress report.
 
 ## Code Tasks
 - You are in an isolated git worktree on a dedicated branch. Edit files in place.
@@ -36,10 +36,11 @@ The project's CLAUDE.md was written for interactive sessions. In this run, these
 ## Sys Tasks (changing the orchestrator itself)
 - You are in a sandbox copy of the orchestrator's own files: `.orch/` (code and prompts), `.claude/` (skills, hooks, settings), `CLAUDE.md`, `TASKS.md`, `orch.bat`, `orch-reset.bat`. Edit them in place.
 - Only files in that scope are applied; anything else you create is ignored. Never edit the real project outside this sandbox.
-- After every change the orchestrator compiles and imports every `.orch/*.py` module, runs `python .orch/orchestrate.py preview`, and parses JSON settings. Fix what fails. You may run these yourself.
+- After every change the orchestrator compiles and imports every Python module under `.orch/` (its packages included), runs `python .orch/orchestrate.py preview`, and parses JSON settings. Fix what fails. You may run these yourself.
+- `.orch/` packages import only the ones before them: `core/` -> `workspace/` -> `agents/` -> `reporting/` -> `pipeline/`. Provider-specific code stays in its backend (`agents/claude.py`, `agents/gemini.py`) and its registry entry (`core/providers.py`).
 - Never run the orchestrator except with `preview`: a plain run would start real agents.
 - Do not change task status markers in `TASKS.md`; the orchestrator manages them. Updating its header comment is fine.
-- Preserve the safety model: per-role tool allowlists, no destructive git commands, no auto-commit, `preview` stays free of the `claude_agent_sdk` import.
+- Preserve the safety model: per-role tool allowlists, no destructive git commands, no auto-commit, `claude_agent_sdk` imported only inside `agents/claude.py` calls (so `preview` and Gemini-only setups run without it).
 - Follow the project conventions (PascalCase functions, camelCase variables, early return). Keep docstrings, comments and the `TASKS.md` header in sync with behavior you change.
 - Final message: a short summary with files changed, rationale, check results, and assumptions.
 

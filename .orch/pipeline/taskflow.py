@@ -10,14 +10,14 @@ import asyncio
 import traceback
 from typing import Callable
 
-from merge import MergeTask
-from phases import PartsNeedingRevision, ReviseParts, RunWork
-from planning import PlanTask
-from review import ReviewTask, VerifyParts
-from runner import RunContext
-from report import UpstreamHistory
-from context import AddRefResults, RefSummary
-from tasks import HasCritical, Part, Task
+from core.context import AddRefResults, RefSummary
+from core.runcontext import RunContext
+from core.tasks import HasCritical, Part, Task
+from pipeline.merge import MergeTask
+from pipeline.phases import PartsNeedingRevision, ReviseParts, RunWork
+from pipeline.planning import PlanTask
+from pipeline.review import ReviewTask, VerifyParts
+from reporting.report import UpstreamHistory
 
 
 async def RunTask(task: Task, ctx: RunContext, maxRounds: int, onFinished: Callable[[Task], None]) -> None:

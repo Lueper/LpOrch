@@ -15,6 +15,11 @@ each other, every revision is re-checked, and the merged result is reviewed agai
   - [ ] [<kind>:<role>] <title> also injects .claude/skills/develop/<role>.md when that file exists
                                 (role skills are not shipped; add your own, e.g. develop/refactorer.md)
 
+Spaces between the parts and the checkbox are optional, and case does not matter: "-[doc]title",
+"- [][Doc] title" and "- [ ] [doc] title" are the same pending task. A task that runs is rewritten in the
+last, standard form. Lines that look like a task but cannot be read ("- [ ] [docs] x", "* [ ] [doc] x",
+"- [ ] [doc]" with no title) are listed as warnings by preview and run.
+
 Indent lines under a task (2+ spaces) to add detailed instructions. These detail lines are settings:
   after: T04, T05     wait for these tasks and build on their results (IDs follow line order:
                       T01, T02, ... - add new tasks at the end so existing IDs stay stable)
@@ -38,11 +43,10 @@ Run:      orch            (PowerShell: .\orch)    or /orch in Claude Code
 Preview:  orch preview    (PowerShell: .\orch preview)
 Reset:    orch-reset      (PowerShell: .\orch-reset)  permanently deletes doc/*.md, report/*.md, run logs and
           this task list (the header stays) after showing counts and asking; "orch-reset --yes" skips the question
-Results:  docs -> doc/[Txx]_<YYMMDD>_<Korean title>.md (one document per task)
+Results:  docs -> doc/[Txx]_<YYMMDD>_<Korean title>.md (one document per task, content only)
           code -> staged, uncommitted changes per task (review with git diff --cached)
           sys  -> applied to the system files; originals in .orch/runs/<run-id>/<Txx>/backup/
-          progress report -> report/[Txx]_<YYMMDD>_<title>.md for every code task that ran (Korean:
-                  timeline, review findings and how they were handled, follow-ups)
+          progress report -> report/[Txx]_<YYMMDD>_<title>.md for every code and doc task that ran (Korean:
+                  timeline, assumptions, review findings and how they were handled, follow-ups)
           logs, reviews, summary -> .orch/runs/<run-id>/
 -->
-

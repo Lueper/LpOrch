@@ -8,7 +8,7 @@ import glob
 import re
 from pathlib import Path
 
-from tasks import STATUS_DONE, SYS_APPLIED_PREFIX, Task
+from core.tasks import STATUS_DONE, SYS_APPLIED_PREFIX, Task
 
 URL_PATTERN = re.compile(r"^https?://", re.IGNORECASE)
 GLOB_CHARS = re.compile(r"[*?\[]")

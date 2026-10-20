@@ -4,17 +4,23 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
-import gitops
-import sandbox
-from report import CheckText, FindingLines
-from runner import AgentSpec, LoadPrompt, LoadSkill, RunAgent, RunContext, WriteText
-from context import TaskContext
-from tasks import Part, PartNeedsRevision, Task
+from agents.runner import AgentSpec, LoadPrompt, LoadSkill, RunAgent, WriteText
+from core.context import TaskContext
+from core.runcontext import RunContext
+from core.tasks import Part, PartNeedsRevision, Task
+from reporting.report import CheckText, FindingLines
+from workspace import gitops, sandbox
 
 MAX_EMBED_CHARS = 60_000  # cap inlined outputs; agents can still Read the full file
 RESPONSE_MARKER = "=== REVIEW RESPONSE ==="  # splits a revision's output from the author's answer to the review
+NOTES_MARKER = "=== NOTES FOR THE REPORT ==="  # splits a document from notes that belong in the progress report
+NOTES_DELIVERY = (
+    f"Keep notes out of the document: assumptions you made (or, when merging, conflicts between parts and how you "
+    f"resolved them) go after the document, below a line `{NOTES_MARKER}`, as bullets - all of them, each time. "
+    "They go to the task's progress report. Omit that line when there is nothing to note."
+)
 DELIVERY = {
-    "doc": "Your final message must be the complete Markdown content for your part and nothing else.",
+    "doc": f"Your final message must be the complete Markdown content for your part. {NOTES_DELIVERY}",
     "code": "Edit the files in this worktree, then end with a short summary: files changed, rationale, test results, assumptions.",
     "sys": "Edit the system files in this sandbox, then end with a short summary: files changed, rationale, check results, assumptions.",
 }
@@ -100,7 +106,10 @@ async def SaveOutput(part: Part, text: str, ctx: RunContext, commitMessage: str)
     """Persist the latest output (archiving the previous round); True when files changed."""
     partDir = ctx.TaskDir(part.id)
     if part.kind == "doc":
-        ArchiveAndWrite(partDir / "output.md", text, part.revisions)
+        document, notes = SplitNotes(text)
+        ArchiveAndWrite(partDir / "output.md", document, part.revisions)
+        if notes:  # the author's assumptions: for the progress report, never in the document
+            ArchiveAndWrite(partDir / "notes.md", notes, part.revisions)
         return True
     if part.kind == "sys":
         changed = bool(await asyncio.to_thread(sandbox.Changes, part.task.baseDir, part.worktree))
@@ -185,6 +194,12 @@ def SplitResponse(text: str) -> tuple[str, str]:
     return (output.rstrip() + "\n", response.strip()) if marker else (text, "")
 
 
+def SplitNotes(text: str) -> tuple[str, str]:
+    """(document, notes for the progress report) from a doc agent's output."""
+    document, marker, notes = text.partition(NOTES_MARKER)
+    return (document.rstrip() + "\n", notes.strip()) if marker else (text, "")
+
+
 def RevisionRequest(intro: str, review: dict, checks: str, kind: str) -> str:
     findings = FindingLines(review) or "- (none listed)"
     lines = [intro, f"Summary: {review.get('summary', '')}", "", "Findings:", findings]
@@ -194,7 +209,7 @@ def RevisionRequest(intro: str, review: dict, checks: str, kind: str) -> str:
         "",
         "Fix every CRITICAL and WARNING finding you agree with, and make failed checks pass. "
         "If you reject a finding, say which one and why.",
-        DELIVERY[kind] if kind != "doc" else "Reply with the complete revised Markdown content, not a diff or a list of changes.",
+        DELIVERY[kind] if kind != "doc" else f"Reply with the complete revised Markdown content, not a diff or a list of changes. {NOTES_DELIVERY}",
         RESPONSE_DELIVERY,
     ]
     return "\n".join(lines)

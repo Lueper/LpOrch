@@ -1,10 +1,10 @@
-"""Korean progress report per code task: what the run recorded about a task - timeline, worker summaries, reviews,
-the author's responses, checks and changed files - summarized by the provider's small_model (orch.toml) once every
-task is final.
+"""Korean progress report per code and doc task: what the run recorded about a task - timeline, worker notes and
+assumptions, reviews, the author's responses, checks, changed files or the document's outline - summarized by the
+provider's small_model (orch.toml) once every task is final.
 
-Written to report/[Txx]_<YYMMDD>_<title>.md, apart from the doc deliverables; doc and sys tasks get none, and
-neither do tasks blocked by "after:" (they did not run). When the model gives no report, the recorded facts are
-written as they are instead.
+Written to report/[Txx]_<YYMMDD>_<title>.md, apart from the doc deliverables, which hold their content only: a doc
+task's assumptions, merge notes and unresolved findings land here. Sys tasks get none, and neither do tasks blocked
+by "after:" (they did not run). When the model gives no report, the recorded facts are written as they are instead.
 """
 from __future__ import annotations
 
@@ -12,15 +12,17 @@ import asyncio
 import re
 from pathlib import Path
 
-from context import TaskContext
-from merge import DocPath, SanitizeTitle
-from report import ROUND_NUMBER, CheckState, ReviewState, TaskStatus
-from runner import AgentSpec, LoadPrompt, RunAgent, RunContext, WriteText
-from tasks import Part, Task
+from agents.runner import AgentSpec, LoadPrompt, RunAgent, WriteText
+from core.context import TaskContext
+from core.paths import REPORT_DIR_NAME, DocPath, SanitizeTitle
+from core.runcontext import RunContext
+from core.tasks import Part, Task
+from reporting.report import ROUND_NUMBER, CheckState, ReviewState, TaskStatus
 
-REPORT_DIR_NAME = "report"  # kept apart from doc/, which holds the doc deliverables
-REPORT_KINDS = ("code",)  # doc tasks are their own record; sys changes are backed up and diffed in the run folder
+REPORT_KINDS = ("code", "doc")  # sys changes are backed up and diffed in the run folder
 MAX_ARTIFACT_CHARS = 8_000  # per artifact; the full files stay in the run folder
+MAX_OUTLINE_HEADINGS = 60  # a doc task's report gets the document's headings, not its text
+HEADING = re.compile(r"^#{1,6} \S")
 # Agent start/finish, checks and outcomes; per-tool progress lines ("[label]   Tool ...") are left out
 LOG_EVENT = re.compile(r"^\S+ (?:INFO|WARNING|ERROR) \[(?P<label>[^\]]+)\] (?! )")
 # Order within a round: the review, the author's response to it, then the version that revision produced
@@ -29,7 +31,7 @@ CURRENT = 10**6  # files without ".rN." hold the final version: after every arch
 
 
 async def WriteProgressReports(tasks: list[Task], ctx: RunContext) -> None:
-    """One report per code task that ran; called once every task, [sys] applies included, is final."""
+    """One report per code or doc task that ran; called once every task, [sys] applies included, is final."""
     reported = [task for task in tasks if task.kind in REPORT_KINDS and not task.blocked]
     await asyncio.gather(*(WriteProgressReport(task, ctx) for task in reported))
 
@@ -72,8 +74,28 @@ def FactSheet(task: Task, ctx: RunContext) -> str:
     lines += [PartFacts(part) for part in task.parts]
     if task.reviews or task.checkOk is not None:  # multi-part tasks: the merged result is reviewed and checked too
         lines.append(f"- Integrated result: review {ReviewState(task)}, revisions {task.revisions}, checks {CheckState(task)}")
-    lines += ["", "Timeline (run log):", *Timeline(task, ctx), "", "Artifacts:", *Artifacts(task, ctx)]
-    return "\n".join(lines)  # code tasks only: no final document to quote
+    lines += ["", "Timeline (run log):", *Timeline(task, ctx)]
+    if task.kind == "doc":
+        lines += ["", "Document outline (headings of the result; the text itself is not included):", *Outline(task, ctx)]
+    lines += ["", "Artifacts:", *Artifacts(task, ctx)]
+    return "\n".join(lines)
+
+
+def Outline(task: Task, ctx: RunContext) -> list[str]:
+    """The headings of a doc task's result: what it covers, without quoting it."""
+    if not task.resultRef:
+        return ["(no document written)"]
+    try:
+        text = ReadText(ctx.projectDir / task.resultRef)
+    except OSError:
+        return ["(document unreadable)"]
+    headings, fenced = [], False
+    for line in text.splitlines():
+        fenced ^= line.lstrip().startswith("```")  # "# comment" lines inside code blocks are not headings
+        if not fenced and HEADING.match(line):
+            headings.append(line.rstrip())
+    more = [f"(+{len(headings) - MAX_OUTLINE_HEADINGS} more headings)"] if len(headings) > MAX_OUTLINE_HEADINGS else []
+    return headings[:MAX_OUTLINE_HEADINGS] + more or ["(no headings)"]
 
 
 def PartFacts(part: Part) -> str:
@@ -124,7 +146,7 @@ def ArtifactText(path: Path) -> str:
     if path.suffix == ".diff":
         return "" if ROUND_NUMBER.search(path.name) else DiffStat(ReadText(path))
     if path.suffix not in (".md", ".json") or path.name.startswith(("output", "merged")):
-        return ""  # doc drafts; doc tasks get no report
+        return ""  # document drafts: the report gets the final document's outline instead
     if path.name.startswith("review.") and path.suffix == ".json":
         return ""  # same content as review.rN.md
     return Head(ReadText(path), MAX_ARTIFACT_CHARS)

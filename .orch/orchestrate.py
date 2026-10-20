@@ -1,16 +1,23 @@
 """Agent orchestrator: every TASKS.md task runs on its own - work -> fresh review -> revision -> result.
 "mode: full" tasks use the multi-agent pipeline (plan -> parallel parts -> ring review -> merge -> integration review).
 Tasks with "after:" wait for those tasks; [sys] tasks change the orchestrator itself and are applied at the end.
-When the run ends, every code task that ran gets a Korean progress report in report/ (progress.py).
+When the run ends, every code and doc task that ran gets a Korean progress report in report/ (reporting/progress.py).
 
 Lives in <project>/.orch/ and always works on <project>, the folder that contains .orch/.
 Usage (via the launcher at the project root):
     orch                 run the pending tasks in TASKS.md      (PowerShell: .\\orch)
     orch preview         show tasks, reviewer pairs and the agent count without running anything
 Options: [--max-parallel N] [--max-rounds N] [--budget-per-agent USD] [--max-turns N]
-         [--provider claude|gemini] [--model NAME] [--cli-path PATH/TO/claude.exe]
-Their defaults, and the provider and model of each agent role, come from orch.toml at the project root (config.py);
-options given here win over the file.
+         [--provider claude|gemini] [--model NAME] [--cli-path PATH]
+Their defaults, and the provider and model of each agent role, come from orch.toml at the project root
+(core/config.py); options given here win over the file. --model and --cli-path apply to the --provider one.
+
+Packages under .orch/, each importing only the ones listed before it:
+    core/       settings, provider registry, task model, TASKS.md, refs, run state (SDK-free)
+    workspace/  git worktrees for code tasks; sandboxes and automated checks for sys tasks
+    agents/     one agent call on its role's provider: runner.py (provider-neutral), claude.py, gemini.py
+    reporting/  review state and gating, summary.md, upstream history, progress reports
+    pipeline/   one task's plan -> work -> review -> merge
 """
 from __future__ import annotations
 
@@ -22,17 +29,22 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-import gitops
-from capacity import AutoParallel
-from config import PROVIDERS, AgentSummary, LoadConfig, OrchConfig, Problems, UsesProvider
-from context import RefLabel, RefTasks, ResolveRefs, ResultFiles, StaleNotices
-from taskfile import LinkDependencies, ParseTasks, RecordResult, UpdateTaskStatus
-from tasks import MAX_PARTS, STATUS_DONE, STATUS_FAILED, STATUS_PENDING, STATUS_RUNNING, Task, TaskFileError
+from core.capacity import AutoParallel
+from core.config import AgentSummary, LoadConfig, OrchConfig, Problems, ProvidersInUse
+from core.context import RefLabel, RefTasks, ResolveRefs, ResultFiles, StaleNotices
+from core.paths import PROJECT_ROOT, RUNS_DIR, SKILL_DIR, TASKS_FILE, WORKTREES_DIR
+from core.providers import PROVIDER_SPECS, PROVIDERS
+from core.runcontext import RunContext
+from core.taskfile import LinkDependencies, ParseTasks, RecordResult, UnreadTaskLines, UpdateTaskStatus
+from core.tasks import MAX_PARTS, STATUS_DONE, STATUS_FAILED, STATUS_PENDING, STATUS_RUNNING, Task, TaskFileError
+from pipeline.merge import ApplySystemTasks
+from pipeline.taskflow import RunTask
+from reporting.progress import WriteProgressReports
+from reporting.report import WriteRunSummary
+from workspace import gitops
+from workspace.sandbox import CreateSnapshot
 
-ORCH_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = ORCH_DIR.parent
-TASKS_FILE = PROJECT_ROOT / "TASKS.md"
-ROLE_SKILL_DIR = PROJECT_ROOT / ".claude" / "skills" / "develop"
+ROLE_SKILL_DIR = SKILL_DIR / "develop"
 MAX_LISTED_REFS = 5  # preview lists this many ref entries per task
 
 
@@ -56,7 +68,7 @@ def ParseArgs(argv: list[str] | None, config: OrchConfig) -> argparse.Namespace:
         help="provider of every role without its own in orch.toml [roles.*] (default: %(default)s)",
     )
     parser.add_argument("--model", default=None, help="model alias or ID for that provider (default: orch.toml, else CLI default)")
-    parser.add_argument("--cli-path", default=None, help="native claude executable (default: orch.toml, else auto-detected)")
+    parser.add_argument("--cli-path", default=None, help="CLI executable for that provider (default: orch.toml, else auto-detected)")
     return parser.parse_args(argv)
 
 
@@ -67,8 +79,8 @@ def ApplyArgs(config: OrchConfig, args: argparse.Namespace) -> OrchConfig:
     config.provider = args.provider
     if args.model is not None:
         config.providers[config.provider].model = args.model.strip() or None
-    if args.cli_path is not None:
-        config.providers["claude"].cliPath = args.cli_path.strip() or None
+    if args.cli_path is not None:  # like --model: the default provider's, not every provider's
+        config.providers[config.provider].cliPath = args.cli_path.strip() or None
     return config
 
 
@@ -104,8 +116,9 @@ def PrintPlan(tasks: list[Task], config: OrchConfig, parallel: int, reason: str)
     print(f"settings: {config.source}; per agent call: ${config.budgetPerAgent:g} cap, {config.maxTurns} turns")
     for line in AgentSummary(config):
         print(f"agents: {line}")
-    if UsesProvider(config, "gemini"):  # what differs from Claude agents (gemini.py)
-        print("gemini: cost not reported ($0 in the summary, tokens in run.log); max_turns applies, budget_per_agent does not")
+    for name in ProvidersInUse(config):  # what differs between providers (core/providers.py)
+        for note in PROVIDER_SPECS[name].notes:
+            print(f"{name}: {note}")
     if any(task.kind == "code" for task in tasks):
         repo = gitops.ResolveRepo(PROJECT_ROOT)
         print(f"git: {repo[0]} @ {repo[1][:8]}" if repo else "git: NOT a repo with commits - code tasks will fail")
@@ -166,11 +179,9 @@ def CreateLogger(runDir: Path) -> logging.Logger:
     return logger
 
 
-def CreateContext(config: OrchConfig, parallel: int):
-    from runner import ResolveCliPath, RunContext  # lazy: keeps `preview` free of the SDK dependency
-
+def CreateContext(config: OrchConfig, parallel: int) -> RunContext:
     runId = datetime.now().strftime("%Y%m%d-%H%M%S")
-    runDir = ORCH_DIR / "runs" / runId
+    runDir = RUNS_DIR / runId
     runDir.mkdir(parents=True)
     repo = gitops.ResolveRepo(PROJECT_ROOT)
     repoRoot, baseCommit = repo if repo else (None, None)
@@ -179,12 +190,11 @@ def CreateContext(config: OrchConfig, parallel: int):
         runDir=runDir,
         projectDir=PROJECT_ROOT,
         repoRoot=repoRoot,
-        worktreeDir=ORCH_DIR / "worktrees" / runId,
+        worktreeDir=WORKTREES_DIR / runId,
         baseCommit=baseCommit,
         config=config,
         log=CreateLogger(runDir),
         semaphore=asyncio.Semaphore(parallel),
-        cliPath=ResolveCliPath(config.providers["claude"].cliPath),
     )
 
 
@@ -213,7 +223,7 @@ def SettleEarlierTasks(allTasks: list[Task]) -> None:
         task.doneEvent.set()
 
 
-def RemoveWorkspaces(tasks: list[Task], ctx) -> None:
+def RemoveWorkspaces(tasks: list[Task], ctx: RunContext) -> None:
     for part in (part for task in tasks for part in task.parts):  # branches and stashes survive
         if part.kind == "code" and part.worktree:
             gitops.RemoveWorktree(ctx.repoRoot, part.worktree)
@@ -231,12 +241,6 @@ def RecordResults(tasks: list[Task], log: logging.Logger) -> None:
 
 
 async def RunPipeline(tasks: list[Task], allTasks: list[Task], config: OrchConfig, parallel: int, reason: str) -> int:
-    from merge import ApplySystemTasks
-    from pipeline import RunTask
-    from progress import WriteProgressReports
-    from report import WriteRunSummary
-    from sandbox import CreateSnapshot
-
     ctx = CreateContext(config, parallel)
     ctx.log.info("%d task(s), up to %d concurrent agent(s) (%s)", len(tasks), parallel, reason)
     for line in AgentSummary(config):  # run.log records which provider/model each role ran on
@@ -277,6 +281,8 @@ def Main(argv: list[str] | None = None) -> int:
     except TaskFileError as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
+    for warning in UnreadTaskLines(TASKS_FILE):  # a typo in a task line would otherwise drop the task silently
+        print(f"warning: {warning}")
     pending = [task for task in allTasks if task.status == STATUS_PENDING]
     # A missing ref stops the run: the agent would otherwise guess at another file
     errors = LinkDependencies(allTasks) + [error for task in pending for error in ResolveRefs(task, PROJECT_ROOT)]

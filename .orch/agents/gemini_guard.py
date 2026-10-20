@@ -8,7 +8,7 @@ write_file (as Write), replace (as Edit) and run_shell_command (as Bash) against
   - PreToolUse command hooks whose matcher fits (e.g. protect-files.sh), run through bash with Claude Code's input;
     exit code 2 or a "block"/"deny" decision blocks the call
 Blocking = exit code 2 with the reason on stderr. Fails closed: input or settings that cannot be read, or a hook that
-cannot be run, block the call too. SDK-free.
+cannot be run, block the call too. SDK-free and standalone (stdlib only): the Gemini CLI runs it by its path.
 """
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-PROJECT_DIR = Path(__file__).resolve().parent.parent
+PROJECT_DIR = Path(__file__).resolve().parents[2]  # agents/ -> .orch/ -> the project
 SETTINGS_FILE = PROJECT_DIR / ".claude" / "settings.json"
 CLAUDE_TOOLS = {"write_file": "Write", "replace": "Edit", "run_shell_command": "Bash"}
 DENY_RULE = re.compile(r"^(?P<tool>\w+)(?:\((?P<pattern>.*)\))?$", re.DOTALL)

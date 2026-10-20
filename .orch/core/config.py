@@ -1,7 +1,8 @@
 """orch.toml: default run options and the provider and model each agent role uses.
 
 The command line overrides the file and the file overrides the built-in defaults below; a missing file or key keeps
-the default. SDK-free so `preview` works without claude_agent_sdk installed.
+the default. Every provider of core/providers.py has its own [<provider>] section with the same keys.
+SDK-free so `preview` works without any provider's SDK installed.
 """
 from __future__ import annotations
 
@@ -10,22 +11,22 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import NamedTuple
 
+from core.providers import PROVIDER_SPECS, PROVIDERS
+
 CONFIG_FILE_NAME = "orch.toml"  # at the project root, next to TASKS.md
-PROVIDERS = ("claude", "gemini")
-# Every agent role; runner.ROLE_TOOLS has the same keys
+# Every agent role; agents/runner.ROLE_TOOLS has the same keys
 ROLES = (
     "doc-worker", "code-worker", "sys-worker", "reviewer", "doc-merger", "code-merger", "planner", "namer", "reporter",
 )
 SMALL_ROLES = ("namer", "reporter")  # one-shot chores: the provider's small_model is enough
 ROLES_SECTION = "roles"  # [roles.<role>] tables override provider and model per role
+PROVIDER_KEYS: dict[str, type] = {"model": str, "small_model": str, "cli_path": str, "max_retries": int}
 # Keys each section accepts and the type of their values
 SECTION_KEYS: dict[str, dict[str, type]] = {
     "run": {"max_parallel": int, "max_rounds": int, "budget_per_agent": float, "max_turns": int},
     "agent": {"provider": str},
-    "claude": {"model": str, "small_model": str, "cli_path": str, "max_retries": int},
-    "gemini": {"model": str, "small_model": str, "cli_path": str, "max_retries": int},
+    **{provider: PROVIDER_KEYS for provider in PROVIDERS},
 }
-GEMINI_MAX_RETRIES = 9  # the Gemini CLI allows at most 10 attempts per request
 ROLE_KEYS: dict[str, type] = {"provider": str, "model": str}
 # orch.toml key -> attribute name
 FIELDS = {
@@ -46,8 +47,8 @@ TYPE_NAMES = {int: "an integer", float: "a number", str: "a string"}
 class ProviderSettings:
     model: str | None = None  # None = the CLI's default model
     smallModel: str | None = None  # namer and reporter; None = model
-    cliPath: str | None = None  # claude: native executable; gemini: executable or gemini.js; None = auto-detect
-    maxRetries: int | None = None  # retries of a failed API request (429, network); None = the CLI's default (10)
+    cliPath: str | None = None  # the provider's CLI, as its backend in agents/ accepts it; None = auto-detect
+    maxRetries: int | None = None  # retries of a failed API request (429, network); None = the CLI's default
 
 
 @dataclass
@@ -62,10 +63,10 @@ class AgentChoice(NamedTuple):
 
 
 def DefaultProviders() -> dict[str, ProviderSettings]:
-    # gemini fails fast: the CLI's own 10 attempts per rate-limited request can stall an agent for many minutes
+    # Each provider's own defaults live in its registry entry (core/providers.py)
     return {
-        "claude": ProviderSettings(smallModel="haiku"),
-        "gemini": ProviderSettings(smallModel="flash-lite", maxRetries=0),
+        name: ProviderSettings(smallModel=spec.smallModel, maxRetries=spec.maxRetries)
+        for name, spec in PROVIDER_SPECS.items()
     }
 
 
@@ -172,16 +173,17 @@ def Problems(config: OrchConfig) -> list[str]:
         (config.budgetPerAgent > 0, "budget_per_agent (--budget-per-agent) must be > 0"),
         (config.maxTurns >= 1, "max_turns (--max-turns) must be >= 1"),
     ]
-    claudeRetries, geminiRetries = (config.providers[name].maxRetries for name in ("claude", "gemini"))
-    limits += [
-        (claudeRetries is None or claudeRetries >= 0, "[claude] max_retries must be >= 0"),
-        (geminiRetries is None or 0 <= geminiRetries <= GEMINI_MAX_RETRIES, f"[gemini] max_retries must be 0-{GEMINI_MAX_RETRIES}"),
-    ]
+    for name, spec in PROVIDER_SPECS.items():  # retryLimit: the most the provider's CLI accepts
+        retries, top = config.providers[name].maxRetries, spec.retryLimit
+        ok = retries is None or (retries >= 0 and (top is None or retries <= top))
+        limits.append((ok, f"[{name}] max_retries must be " + (">= 0" if top is None else f"0-{top}")))
     return [message for ok, message in limits if not ok]
 
 
-def UsesProvider(config: OrchConfig, provider: str) -> bool:
-    return any(config.AgentFor(role).provider == provider for role in ROLES)
+def ProvidersInUse(config: OrchConfig) -> list[str]:
+    """The providers at least one role runs on, in registry order."""
+    used = {config.AgentFor(role).provider for role in ROLES}
+    return [name for name in PROVIDERS if name in used]
 
 
 def AgentSummary(config: OrchConfig) -> list[str]:

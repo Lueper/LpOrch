@@ -14,6 +14,6 @@ allowed-tools: Bash(python .orch/orchestrate.py:*), Read, Glob
 3. When the background command finishes, read the newest `.orch/runs/*/summary.md` and report:
    - each task's status, number of parts, review result (including integration review and automated checks), and cost
    - where each task's result went: one document per doc task under `doc/` (`[Txx]_YYMMDD_title.md`), code changes staged in the working tree (`git diff --cached`), and system files applied by `[sys]` tasks (originals backed up in `.orch/runs/<run-id>/<Txx>/backup/`, full diff in `sys.diff`)
-   - each code task's Korean progress report (`report/[Txx]_YYMMDD_<title>.md`, listed under "Progress reports" in `summary.md`; doc and sys tasks get none)
+   - each code and doc task's Korean progress report (`report/[Txx]_YYMMDD_<title>.md`, listed under "Progress reports" in `summary.md`; sys tasks get none). A doc task's assumptions and unresolved findings are there, not in the document
    - failed tasks with their reason (they are marked `[!]` in `TASKS.md`; set them back to `[ ]` to retry) and blocked tasks (left `[ ]` because an `after:` task did not succeed)
 4. Do not commit, and do not edit the files the run produced.

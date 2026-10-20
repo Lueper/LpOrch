@@ -188,12 +188,13 @@ def RunStep(name: str, command: list[str] | str, cwd: Path, timeout: int) -> tup
 
 
 def SmokeTest(root: Path) -> list[tuple[bool, str]]:
-    """Compile and import the orchestrator in root, run its preview, then parse its JSON settings."""
+    """Compile and import every orchestrator module in root (packages included), run its preview, then parse its JSON
+    settings."""
     orch = root / ".orch"
-    modules = sorted(path.stem for path in orch.glob("*.py"))
-    imports = "; ".join(f"import {module}" for module in modules)
+    sources = sorted(relative for relative, _ in WalkFiles(orch) if relative.endswith(".py"))  # skips runs/, caches
+    imports = "; ".join(f"import {ModuleName(relative)}" for relative in sources)
     steps = [
-        ("compile", [sys.executable, "-m", "py_compile", *(str(orch / f"{module}.py") for module in modules)]),
+        ("compile", [sys.executable, "-m", "py_compile", *(str(orch / relative) for relative in sources)]),
         ("import", [sys.executable, "-c", f"import sys; sys.path.insert(0, {str(orch)!r}); {imports}"]),
         ("preview", [sys.executable, str(orch / "orchestrate.py"), "preview"]),
     ]
@@ -203,6 +204,11 @@ def SmokeTest(root: Path) -> list[tuple[bool, str]]:
         if not results[-1][0]:
             break
     return results + [CheckJson(relative, path) for relative, path in SystemFiles(root).items() if path.suffix == ".json"]
+
+
+def ModuleName(relative: str) -> str:
+    """The import name of a module under .orch/: "agents/claude.py" -> "agents.claude", "core/__init__.py" -> "core"."""
+    return relative.removesuffix(".py").removesuffix("/__init__").replace("/", ".")
 
 
 def CheckJson(relative: str, path: Path) -> tuple[bool, str]:

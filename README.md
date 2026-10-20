@@ -1,6 +1,6 @@
 # LpOrch
 
-`TASKS.md`에 작업을 한 줄씩 적어두면, `.orch` 오케스트레이터가 이를 읽어 여러 Claude Code 에이전트를 병렬로 실행하고 **Plan → Work → Review → Merge** 과정을 거쳐 문서·코드·시스템 변경 결과물을 만들어내는 자동화 시스템임.
+`TASKS.md`에 작업을 한 줄씩 적어두면, `.orch` 오케스트레이터가 이를 읽어 여러 AI 에이전트(Claude Code 또는 Gemini CLI, 역할별 선택)를 병렬로 실행하고 **Plan → Work → Review → Merge** 과정을 거쳐 문서·코드·시스템 변경 결과물을 만들어내는 자동화 시스템임.
 
 ```mermaid
 flowchart LR
@@ -24,10 +24,11 @@ flowchart LR
 ## 요구사항
 
 - Python 3.11+
-- [Claude Code](https://docs.claude.com/claude-code) CLI (native 설치 또는 npm 설치) — 로그인된 계정/API 키 필요
+- 사용하는 provider의 CLI (역할 하나라도 그 provider를 쓰는 경우에만 필요)
+  - claude: [Claude Code](https://docs.claude.com/claude-code) CLI (native 설치 또는 npm 설치) + `claude-agent-sdk` — 로그인된 계정/API 키 필요
+  - gemini: [Gemini CLI](https://github.com/google-gemini/gemini-cli) — 아래 "Gemini provider" 참조
 - Node.js + npx — `.mcp.json`에 등록된 MCP 서버(`context7`, `sequential-thinking`, `notion` 등) 실행용
 - `code` 작업을 쓸 경우 프로젝트가 git 저장소여야 함
-- (선택) Gemini provider 사용 시 [Gemini CLI](https://github.com/google-gemini/gemini-cli) — 아래 "Gemini provider" 참조
 
 ## 설치
 
@@ -35,7 +36,7 @@ flowchart LR
 pip install -r .orch/requirements.txt
 ```
 
-`claude-agent-sdk`만 설치하면 됨. Claude Code CLI는 별도로 로그인되어 있어야 함.
+`claude-agent-sdk`만 설치하면 됨(claude provider용). Claude Code CLI는 별도로 로그인되어 있어야 함. SDK는 claude 역할이 처음 실행될 때 import되므로, gemini만 쓰거나 `orch preview`만 실행할 때는 없어도 동작함.
 
 ## 빠른 시작
 
@@ -59,7 +60,7 @@ pip install -r .orch/requirements.txt
 
    Claude Code 안에서는 `/orch`, `/orch preview`로도 실행 가능함.
 
-4. 결과 확인 — `doc/[Txx]_<날짜>_<제목>.md`, `git diff --cached`(code), `report/[Txx]_<날짜>_<제목>.md`(code Task별 진행 보고), `.orch/runs/<run-id>/summary.md`
+4. 결과 확인 — `doc/[Txx]_<날짜>_<제목>.md`, `git diff --cached`(code), `report/[Txx]_<날짜>_<제목>.md`(code·doc Task별 진행 보고), `.orch/runs/<run-id>/summary.md`
 
 ## 설정 (orch.toml)
 
@@ -77,13 +78,13 @@ pip install -r .orch/requirements.txt
 | | `cli_path` | `""` | `--cli-path` | native claude 실행 파일, `""` = 자동 탐지 |
 | | `max_retries` | (CLI 기본 10) | — | API 요청 실패(429·529·네트워크) 재시도 횟수. 지정 시 `CLAUDE_CODE_MAX_RETRIES`로 전달 |
 | `[gemini]` | `model` / `small_model` | `""` / `"flash-lite"` | `--model` | `[claude]`와 동일한 의미 (`""` = CLI 기본 `auto`) |
-| | `cli_path` | `""` | — | gemini 실행 파일 또는 `gemini.js`, `""` = 자동 탐지 |
+| | `cli_path` | `""` | `--cli-path` | gemini 실행 파일 또는 `gemini.js`, `""` = 자동 탐지 |
 | | `max_retries` | `0` | — | API 요청 실패(429 quota·네트워크) 재시도 횟수(0~9). `0` = 즉시 실패 (CLI 기본은 요청당 10회) |
 | `[roles.<역할>]` | `provider`, `model` | — | — | 역할별 override |
 
 - 역할: `doc-worker`, `code-worker`, `sys-worker`, `reviewer`, `doc-merger`, `code-merger`, `planner`, `namer`, `reporter`
 - 역할의 model 결정 순서: `[roles.<역할>] model` → (namer·reporter만) provider의 `small_model` → provider의 `model` → CLI 기본 모델
-- `--model`은 기본 provider(`--provider` 또는 `[agent] provider`)의 `model`만 바꾸며, `[roles.*]` override는 그대로 유지됨
+- `--model`·`--cli-path`는 기본 provider(`--provider` 또는 `[agent] provider`)의 `model`·`cli_path`만 바꾸며, `[roles.*]` override와 다른 provider 설정은 그대로 유지됨
 - `orch preview`에 적용된 설정 파일과 역할별 provider/model이 표시됨
 
 ```toml
@@ -93,9 +94,19 @@ provider = "gemini"
 model = "pro"
 ```
 
+### Provider 구조
+
+claude와 gemini는 같은 interface를 가진 backend로 대칭 구성됨.
+
+- **공통 호출**: 모든 phase는 `agents/runner.py`의 `RunAgent`만 호출함. `RunAgent`는 역할의 provider를 골라 그 backend의 `Run(label, prompt, spec, ctx, model) -> AgentResult`를 실행함
+- **backend**: `agents/claude.py`(claude_agent_sdk), `agents/gemini.py`(Gemini CLI headless). 처음 호출될 때 import되므로 쓰지 않는 provider의 SDK·CLI는 필요 없음
+- **공통 규격**: 역할별 도구(`ROLE_TOOLS`, Claude Code 도구 이름 기준), structured output용 JSON schema(`AgentSpec.schema`), tool 진행 로그 형식은 `runner.py`에서 정의하고, 각 backend가 자기 방식으로 변환함
+- **등록**: `core/providers.py`에 provider별 기본값(`small_model`, `max_retries`), `max_retries` 상한, preview 안내문, backend 모듈을 등록함. `orch.toml`의 `[<provider>]` 섹션 검증·기본값은 여기서 자동으로 따라옴
+- provider 추가 = `core/providers.py` 항목 1개 + `agents/<provider>.py` backend 1개
+
 ### Gemini provider
 
-`provider = "gemini"`인 역할은 Gemini CLI를 headless(`stream-json`)로 실행함 (`.orch/gemini.py`). ring review(`mode: full`)에서 리뷰어와 작업자의 provider가 다르면 세션을 이어받을 수 없어 fresh reviewer로 대체됨.
+`provider = "gemini"`인 역할은 Gemini CLI를 headless(`stream-json`)로 실행함 (`.orch/agents/gemini.py`). ring review(`mode: full`)에서 리뷰어와 작업자의 provider가 다르면 세션을 이어받을 수 없어 fresh reviewer로 대체됨.
 
 - **준비**: Gemini CLI 설치 후 인증. API key(OS keychain에 저장된 key 또는 `GEMINI_API_KEY` 환경변수)나 Vertex 환경변수 방식 권장
 - **실행 격리**: 실행마다 `.orch/runs/<run-id>/gemini/home`을 `GEMINI_CLI_HOME`으로 사용함
@@ -103,7 +114,7 @@ model = "pro"
   - 세션도 이 폴더에 저장되며 사용자의 `~/.gemini`는 건드리지 않음
   - `~/.gemini`의 파일에만 있는 인증(OAuth 로그인 캐시, `~/.gemini/.env`의 key)은 이 폴더에서 보이지 않음
 - **도구 제한**: Claude 역할별 도구를 Gemini built-in으로 변환한 policy(`--policy`)를 적용함. 나머지 도구와 MCP는 전부 차단됨
-- **보안장치**: `write_file`/`replace`/`run_shell_command` 호출 전에 `.orch/gemini_guard.py`가 실행됨
+- **보안장치**: `write_file`/`replace`/`run_shell_command` 호출 전에 `.orch/agents/gemini_guard.py`가 실행됨
   - 프로젝트 `.claude/settings.json`의 `permissions.deny` 규칙과 PreToolUse hook(`protect-files.sh` 등)을 그대로 적용함
   - 검사 자체를 할 수 없으면 차단함(fail closed)
 - **역할 프롬프트**: system prompt에 덧붙일 수 없어 세션 첫 메시지 앞에 넣음
@@ -130,6 +141,8 @@ model = "pro"
 - `<kind>` : `doc` / `code` / `sys` 중 하나
 - `<role>` : (선택) `.claude/skills/develop/<role>.md` 스킬 추가 주입 (예: `code:refactorer`, `doc:researcher`)
 - 상태 마커: `[ ]` 대기, `[~]` 실행 중, `[x]` 완료, `[!]` 실패 — `[!]`/`[x]`를 `[ ]`로 되돌리면 재시도됨
+- 구분 공백과 checkbox는 생략 가능하고 대소문자는 무시됨: `-[doc]제목`, `- [][Doc] 제목`, `- [ ] [doc] 제목`은 모두 같은 대기 작업. 실행되는 작업 줄은 표준 형식(`- [~] [doc] 제목`)으로 다시 쓰임
+- 작업처럼 보이지만 인식되지 않는 줄(`- [ ] [docs] x`, `* [ ] [doc] x`, 제목 없는 `- [ ] [doc]` 등)은 `orch preview`·`orch` 실행 시 `warning: TASKS.md line N is not read as a task ...`로 표시됨. 실행은 계속됨
 
 | kind | 설명 | 결과물 위치 |
 |---|---|---|
@@ -167,10 +180,10 @@ model = "pro"
 
 ## 결과물 확인
 
-- `doc` → `doc/[Txx]_<YYMMDD>_<제목>.md` (1작업당 1문서)
+- `doc` → `doc/[Txx]_<YYMMDD>_<제목>.md` (1작업당 1문서). 문서에는 본문만 들어가고, 작성자의 가정 사항·병합 메모·미해결 리뷰 지적은 진행 보고로 감
 - `code` → 워킹 트리에 staged 변경 (`git diff --cached`로 리뷰)
 - `sys` → 시스템 파일에 직접 적용, 원본 백업은 `.orch/runs/<run-id>/<Txx>/backup/`, 전체 diff는 `sys.diff`
-- 진행 보고 → 실행된 code Task마다 `report/[Txx]_<YYMMDD>_<제목>.md` 생성 (doc/sys Task는 생성 안 함). run 종료 시 `small_model`(기본 haiku)이 run 기록(`run.log`, `notes`/`review`/`response`/`checks`, 변경 파일)을 읽고 개요·진행 경과·작업 내용·리뷰 지적사항 및 처리 결과·후속 조치를 한국어로 정리함 (요약 실패 시 원자료를 그대로 기록, `after:` 선행 실패로 blocked된 Task는 제외)
+- 진행 보고 → 실행된 code·doc Task마다 `report/[Txx]_<YYMMDD>_<제목>.md` 생성 (sys Task는 생성 안 함). run 종료 시 `small_model`(기본 haiku)이 run 기록(`run.log`, `notes`/`review`/`response`/`checks`, 변경 파일 또는 문서 목차)을 읽고 개요·진행 경과·작업 내용·가정 사항·리뷰 지적사항 및 처리 결과·후속 조치를 한국어로 정리함 (요약 실패 시 원자료를 그대로 기록, `after:` 선행 실패로 blocked된 Task는 제외)
 - 로그/리뷰/요약 → `.orch/runs/<run-id>/summary.md`에서 작업별 상태·파트 수·리뷰 결과·비용 확인 가능
 
 ## 디렉터리 구조
@@ -183,18 +196,35 @@ model = "pro"
 ├── orch.toml              # 실행 옵션 기본값, 역할별 provider/model
 ├── CLAUDE.md              # Claude Code 전역 규칙
 ├── doc/                   # doc 작업 결과물
-├── report/                # code Task별 진행 보고
-├── .orch/                 # 오케스트레이터 본체 (Python)
-│   ├── orchestrate.py     # 진입점
-│   ├── config.py          # orch.toml 로드·검증, 역할별 provider/model 결정
-│   ├── gemini.py          # Gemini CLI backend (gemini provider 역할 실행)
-│   ├── gemini_guard.py    # Gemini 쓰기·shell 호출에 .claude 보안 규칙 적용하는 hook
-│   ├── phases.py / pipeline.py / review.py / merge.py  # Plan-Work-Review-Merge 파이프라인
-│   ├── planning.py        # mode: full Part 분할
-│   ├── progress.py        # Task별 한국어 진행 보고 생성
-│   ├── capacity.py        # 자동 병렬 수 결정
-│   ├── gitops.py          # code 작업용 git worktree 관리
-│   ├── sandbox.py         # sys 작업용 샌드박스 관리
+├── report/                # code·doc Task별 진행 보고
+├── .orch/                 # 오케스트레이터 본체 (Python, 패키지는 위쪽 패키지만 import함)
+│   ├── orchestrate.py     # 진입점 (orch run / preview)
+│   ├── reset.py           # 진입점 (orch-reset)
+│   ├── core/              # SDK-free 기반
+│   │   ├── paths.py       # 프로젝트 경로, 산출물 파일명(doc/·report/)
+│   │   ├── providers.py   # provider registry (기본값, retry 상한, preview 안내, backend 모듈)
+│   │   ├── config.py      # orch.toml 로드·검증, 역할별 provider/model 결정
+│   │   ├── runcontext.py  # run 전체가 공유하는 상태 (RunContext)
+│   │   ├── tasks.py / taskfile.py  # Task/Part 모델, TASKS.md 파싱·기록
+│   │   ├── context.py     # ref 자료, 선행 결과, 프롬프트 context
+│   │   └── capacity.py    # 자동 병렬 수 결정
+│   ├── workspace/
+│   │   ├── gitops.py      # code 작업용 git worktree 관리
+│   │   └── sandbox.py     # sys 작업용 샌드박스, 자동 체크
+│   ├── agents/
+│   │   ├── runner.py      # provider 중립 에이전트 호출 (AgentSpec, AgentResult, RunAgent)
+│   │   ├── claude.py      # Claude backend (claude_agent_sdk)
+│   │   ├── gemini.py      # Gemini backend (Gemini CLI headless)
+│   │   └── gemini_guard.py  # Gemini 쓰기·shell 호출에 .claude 보안 규칙 적용하는 hook
+│   ├── reporting/
+│   │   ├── report.py      # 리뷰 상태·gating, summary.md, 선행 Task 리뷰 이력
+│   │   └── progress.py    # Task별 한국어 진행 보고 생성
+│   ├── pipeline/
+│   │   ├── taskflow.py    # Task 1개의 전체 흐름 (upstream 대기 → plan → work → review → merge)
+│   │   ├── planning.py    # mode: full Part 분할
+│   │   ├── phases.py      # workspace 준비, 작업, 수정, 자동 체크
+│   │   ├── review.py      # ring review, verify, 통합 리뷰
+│   │   └── merge.py       # Part 병합, 결과 반영 (doc 작성, code staging, sys 적용)
 │   ├── prompts/           # 역할별(worker/reviewer/merger/namer/reporter) 프롬프트
 │   └── runs/              # 실행별 로그/리뷰/요약 (git에는 미포함)
 └── .claude/

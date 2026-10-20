@@ -4,21 +4,18 @@ doc/[Txx]_<YYMMDD>_<title>.md, staged code changes, or system files applied when
 from __future__ import annotations
 
 import asyncio
-import re
 from pathlib import Path
 
-import gitops
-import sandbox
-from phases import Clip, GitCall, RevisionRequest, RunChecks, SplitResponse, WorkerSystemPrompt
-from report import BlockingIssues, OpenIssues, ReviewState
-from review import IntegrationLoop
-from runner import AgentSpec, LoadPrompt, RunAgent, RunContext, WriteText
-from tasks import SYS_APPLIED_PREFIX, Part, Task
+from agents.runner import AgentSpec, LoadPrompt, RunAgent, WriteText
+from core.paths import DocPath, SanitizeTitle
+from core.runcontext import RunContext
+from core.tasks import SYS_APPLIED_PREFIX, Part, Task
+from pipeline.phases import ArchiveAndWrite, Clip, GitCall, RevisionRequest, RunChecks, SplitNotes, SplitResponse, WorkerSystemPrompt
+from pipeline.review import IntegrationLoop
+from reporting.report import BlockingIssues, OpenIssues, ReviewState
+from workspace import gitops, sandbox
 
-DOC_DIR_NAME = "doc"
 TITLE_SCHEMA = {"type": "object", "properties": {"title": {"type": "string"}}, "required": ["title"]}
-INVALID_FILENAME_CHARS = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
-MAX_TITLE_CHARS = 40
 NAMER_INPUT_CHARS = 3000  # the head of the document is enough to name it
 
 
@@ -41,9 +38,7 @@ async def MergeDocTask(task: Task, ctx: RunContext, maxRounds: int) -> None:
     content, source, session = await DocContent(task, ctx)
     if session and maxRounds > 0:  # several parts merged by an agent: review the whole
         content = await ReviewMergedDoc(task, ctx, maxRounds, content, session)
-    issues = OpenIssues(task)
-    if issues:
-        content = f"{content.rstrip()}\n\n## Open Issues\n\n{issues}"
+    # The document holds only its content: unresolved findings go to the progress report and summary.md
     path = DocPath(task, ctx, await KoreanTitle(task, content, ctx))
     path.parent.mkdir(exist_ok=True)
     WriteText(path, content.rstrip() + "\n")
@@ -55,10 +50,7 @@ async def MergeDocTask(task: Task, ctx: RunContext, maxRounds: int) -> None:
 async def DocContent(task: Task, ctx: RunContext) -> tuple[str, str, str | None]:
     """(document, how it was built, merger session); one part is used as-is, several are merged by an agent."""
     if len(task.parts) == 1:
-        part = task.parts[0]
-        output = (ctx.TaskDir(part.id) / "output.md").read_text(encoding="utf-8")
-        issues = OpenIssues(part)
-        return (f"{output.rstrip()}\n\n## Open Issues\n\n{issues}" if issues else output), "1 part", None
+        return (ctx.TaskDir(task.parts[0].id) / "output.md").read_text(encoding="utf-8"), "1 part", None
     spec = AgentSpec(role="doc-merger", cwd=ctx.runDir, systemAppend=LoadPrompt("merger"))
     prompt = (
         f"Assemble the parts of task {task.id} ({task.title}) into one document. "
@@ -67,7 +59,10 @@ async def DocContent(task: Task, ctx: RunContext) -> tuple[str, str, str | None]
     result = await RunAgent(f"{task.id} merge", prompt, spec, ctx)
     task.costUsd += result.costUsd
     if result.ok:
-        return result.text, f"merged {len(task.parts)} parts", result.sessionId
+        document, notes = SplitNotes(result.text)
+        if notes:  # how the merger resolved conflicts between parts: for the progress report
+            WriteText(ctx.TaskDir(task.id) / "notes.md", notes)
+        return document, f"merged {len(task.parts)} parts", result.sessionId
     # Fallback: concatenate so the task still yields a usable document
     task.notes.append(f"merge agent failed ({result.error}); parts concatenated")
     return "\n\n".join(PartBlock(part, ctx) for part in task.parts), f"{len(task.parts)} parts concatenated", None
@@ -98,10 +93,13 @@ async def ReviewMergedDoc(task: Task, ctx: RunContext, maxRounds: int, content: 
             task.notes.append(f"merge fix failed: {result.error}")
             return False
         output, response = SplitResponse(result.text)
+        output, notes = SplitNotes(output)
         state["session"], state["rounds"] = result.sessionId or state["session"], state["rounds"] + 1
         task.responses.append(response)
         merged.replace(merged.with_name(f"merged.r{state['rounds'] - 1}.md"))
         WriteText(merged, output)
+        if notes:
+            ArchiveAndWrite(ctx.TaskDir(task.id) / "notes.md", notes, state["rounds"] - 1)
         return True
 
     await IntegrationLoop(task, ctx, maxRounds, ctx.projectDir, [ctx.runDir], Snapshot, Fix)
@@ -114,30 +112,13 @@ async def KoreanTitle(task: Task, content: str, ctx: RunContext) -> str:
         role="namer",
         cwd=ctx.runDir,
         systemAppend=LoadPrompt("namer"),
-        outputFormat={"type": "json_schema", "schema": TITLE_SCHEMA},
+        schema=TITLE_SCHEMA,
     )
     prompt = f"Task: {task.title}\n\nDocument (beginning):\n{content[:NAMER_INPUT_CHARS]}"
     result = await RunAgent(f"{task.id} title", prompt, spec, ctx)  # the Korean title in the doc's file name
     task.costUsd += result.costUsd
     data = result.structured if result.ok and isinstance(result.structured, dict) else {}
     return SanitizeTitle(str(data.get("title", ""))) or SanitizeTitle(task.title) or ctx.runId
-
-
-def SanitizeTitle(title: str) -> str:
-    # Windows-safe file name: drop reserved characters, spaces -> "_", bounded length
-    cleaned = INVALID_FILENAME_CHARS.sub("", title)
-    cleaned = re.sub(r"\s+", "_", cleaned.strip()).strip("._")
-    return cleaned[:MAX_TITLE_CHARS].rstrip("._")
-
-
-def DocPath(task: Task, ctx: RunContext, title: str, dirName: str = DOC_DIR_NAME) -> Path:
-    """<dirName>/[Txx]_<YYMMDD>_<title>.md (doc/ by default); never overwrites - adds _2, _3, ... when the name is taken."""
-    stem = f"[{task.id}]_{ctx.runId[2:8]}_{title}"  # runId is YYYYMMDD-HHMMSS
-    docDir = ctx.projectDir / dirName  # progress reports go to their own folder (progress.py)
-    path, counter = docDir / f"{stem}.md", 2
-    while path.exists():
-        path, counter = docDir / f"{stem}_{counter}.md", counter + 1
-    return path
 
 
 # ---------- workspaces (code and sys) ----------

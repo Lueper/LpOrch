@@ -1,5 +1,5 @@
-"""Gemini CLI backend: one agent call as a headless `gemini` process, mapped onto what the pipeline uses from
-claude_agent_sdk.
+"""Gemini backend: one agent call as a headless `gemini` process, mapped onto runner's provider-neutral AgentSpec and
+AgentResult.
 
 - tools: runner.ROLE_TOOLS translated to Gemini built-ins; a per-role policy denies everything else (MCP included)
 - role prompt: the CLI cannot append to its system prompt, so it opens the first message of every new session
@@ -7,7 +7,8 @@ claude_agent_sdk.
   files in folders an administrator does not own) - the user's own settings, plus CLAUDE.md as a context file,
   max_turns, and gemini_guard.py before write and shell calls (the project's Claude Code hooks and deny rules).
   Sessions live in that home too, apart from the user's own; the API key comes from the OS keychain or env vars.
-- structured output: asked for in the prompt, parsed from the reply, asked again once when it is not valid JSON
+- structured output: spec.schema asked for in the prompt, parsed from the reply, asked again once when it is not
+  valid JSON
 - resume: --resume <session id> from the session's own folder; fork: a copy of the saved session (--session-file)
 The CLI reports tokens, not money: calls count as $0 and their token use goes to run.log. budget_per_agent does not
 apply to Gemini calls; max_turns does.
@@ -24,7 +25,8 @@ import shutil
 import sys
 from pathlib import Path
 
-from runner import PROGRESS_KEYS, ROLE_TOOLS, AgentResult, AgentSpec, RunContext, WriteText
+from agents.runner import ROLE_TOOLS, AgentResult, AgentSpec, LogToolUse, WriteText
+from core.runcontext import RunContext
 
 GUARD_SCRIPT = Path(__file__).resolve().parent / "gemini_guard.py"
 # Claude Code tool -> its Gemini CLI built-ins
@@ -45,7 +47,7 @@ NO_MCP_SERVER = "__orch_none__"  # --allowed-mcp-server-names that matches no se
 GEMINI_DIR = ".gemini"  # the CLI's folder under its home: settings.json, sessions (tmp/<project>/chats)
 STREAM_LIMIT = 64 * 1024**2  # one stream-json line can carry a whole tool result
 MAX_STDERR_CHARS = 2000  # tail of the CLI's stderr kept in a failed call's error
-EXTRA_PROGRESS_KEYS = ("dir_path", "prompt")  # Gemini parameter names worth echoing besides runner's
+EXTRA_PROGRESS_KEYS = ("dir_path", "prompt")  # Gemini parameter names worth echoing besides runner.PROGRESS_KEYS
 # Failed API attempts and quota details on stderr: shown on the console, or a rate-limited agent looks stalled
 API_FAILURE = re.compile(r"^(?:Attempt \d+ failed\b|\* Quota exceeded for metric:)")
 MAX_NOTICE_CHARS = 200
@@ -63,13 +65,13 @@ class GeminiError(Exception):
     """The CLI or a saved session cannot be found."""
 
 
-async def RunGemini(label: str, prompt: str, spec: AgentSpec, ctx: RunContext, model: str | None) -> AgentResult:
-    """One agent call; with outputFormat, the reply's JSON lands in result.structured (asked once more if invalid)."""
+async def Run(label: str, prompt: str, spec: AgentSpec, ctx: RunContext, model: str | None) -> AgentResult:
+    """One agent call; with spec.schema, the reply's JSON lands in result.structured (asked once more if invalid)."""
     try:
         command = GeminiCommand(ctx.config.providers["gemini"].cliPath)
         sessionFile = ForkSource(spec.resume, ctx) if spec.fork and spec.resume else None
         result = await RunProcess(label, command, ComposePrompt(prompt, spec), spec, ctx, model, sessionFile)
-        if spec.outputFormat and result.ok:
+        if spec.schema and result.ok:
             await ParseStructured(label, command, result, spec, ctx, model)
     except Exception as error:  # system boundary: CLI process / stream / session-file failures
         return AgentResult(error=f"{type(error).__name__}: {error}")
@@ -82,14 +84,14 @@ def ComposePrompt(prompt: str, spec: AgentSpec) -> str:
     """The role prompt opens every new or forked session; a resumed session of the same role already has it."""
     parts = [ROLE_INTRO, spec.systemAppend, TASK_INTRO] if spec.systemAppend and (not spec.resume or spec.fork) else []
     parts.append(prompt)
-    if spec.outputFormat:
-        parts += [JSON_REQUEST, json.dumps(spec.outputFormat["schema"], ensure_ascii=False)]
+    if spec.schema:
+        parts += [JSON_REQUEST, json.dumps(spec.schema, ensure_ascii=False)]
     return "\n\n".join(parts)
 
 
 async def ParseStructured(label: str, command: tuple[str, ...], result: AgentResult, spec: AgentSpec, ctx: RunContext,
                           model: str | None) -> None:
-    schema = spec.outputFormat["schema"]
+    schema = spec.schema
     result.structured = ExtractJson(result.text, schema)
     if result.structured is not None or not result.sessionId:
         return
@@ -221,7 +223,8 @@ class Stream:
             self.text = self.text + content if event.get("delta") else content
         elif kind == "tool_use":
             self.afterTool = True
-            self.LogToolUse(event)
+            params = event.get("parameters") or {}
+            LogToolUse(self.label, event.get("tool_name", "?"), params, self.ctx, EXTRA_PROGRESS_KEYS)
         elif kind == "tool_result":
             self.afterTool = True
             if event.get("status") == "error":
@@ -231,13 +234,6 @@ class Stream:
             self.ctx.log.warning("[%s]   gemini: %s", self.label, self.lastError)
         elif kind == "result":
             self.outcome = event
-
-    def LogToolUse(self, event: dict) -> None:
-        # Same progress line as runner.LogToolUse: shows a long-running agent is alive
-        params = event.get("parameters") or {}
-        keys = (*PROGRESS_KEYS, *EXTRA_PROGRESS_KEYS)
-        detail = next((str(params[key]) for key in keys if key in params), "")
-        self.ctx.log.info("[%s]   %s %s", self.label, event.get("tool_name", "?"), detail.replace("\n", " ")[:80])
 
     def LogTokens(self) -> None:
         stats = self.outcome.get("stats") or {}

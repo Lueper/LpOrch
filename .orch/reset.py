@@ -4,8 +4,8 @@ Usage (via the launcher at the project root):
     orch-reset           list what will be deleted and ask first     (PowerShell: .\\orch-reset)
     orch-reset --yes     delete without asking
 Deletes permanently: doc/*.md (subfolders such as doc/refs/ are kept), report/*.md, .orch/runs/*,
-.orch/worktrees/*, .orch/__pycache__, and the task list of TASKS.md (from the first task line on; the header
-comment stays).
+.orch/worktrees/*, the Python caches in .orch/ and its packages, and the task list of TASKS.md (from the first task
+line on; the header comment stays).
 """
 from __future__ import annotations
 
@@ -14,16 +14,12 @@ import shutil
 import sys
 from pathlib import Path
 
-from taskfile import TASK_PATTERN, ReadLines, WriteLines
+from core.paths import DOC_DIR_NAME, ORCH_DIR, PROJECT_ROOT, REPORT_DIR_NAME, RUNS_DIR, TASKS_FILE, WORKTREES_DIR
+from core.taskfile import TASK_PATTERN, ReadLines, TaskStatus, WriteLines
+from core.tasks import STATUS_RUNNING
 
-ORCH_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = ORCH_DIR.parent
-TASKS_FILE = PROJECT_ROOT / "TASKS.md"
-DOC_DIR = PROJECT_ROOT / "doc"
-REPORT_DIR = PROJECT_ROOT / "report"  # progress reports of code tasks (progress.py)
-RUNS_DIR = ORCH_DIR / "runs"
-WORKSPACE_DIR = ORCH_DIR / "worktrees"
-CACHE_DIR = ORCH_DIR / "__pycache__"
+DOC_DIR = PROJECT_ROOT / DOC_DIR_NAME
+REPORT_DIR = PROJECT_ROOT / REPORT_DIR_NAME  # progress reports (reporting/progress.py)
 
 
 def TaskListStart(lines: list[str]) -> int:
@@ -33,7 +29,9 @@ def TaskListStart(lines: list[str]) -> int:
 
 def RunInProgress(lines: list[str]) -> str | None:
     """Why resetting now would break a running orchestrator, or None."""
-    if any(line.startswith("- [~]") for line in lines):
+    # Matched like ParseTasks does, so "-[~][doc]x" counts too
+    matches = [TASK_PATTERN.match(line.rstrip("\r\n")) for line in lines]
+    if any(match and TaskStatus(match) == STATUS_RUNNING for match in matches):
         return "TASKS.md has a running task [~]"
     unfinished = [path.name for path in RunDirs() if not (path / "summary.md").is_file()]
     return f"run {unfinished[-1]} has no summary.md yet" if unfinished else None
@@ -41,6 +39,11 @@ def RunInProgress(lines: list[str]) -> str | None:
 
 def RunDirs() -> list[Path]:
     return sorted(path for path in RUNS_DIR.iterdir() if path.is_dir()) if RUNS_DIR.is_dir() else []
+
+
+def CacheDirs() -> list[Path]:
+    """Python caches of .orch/ itself and of each of its packages (core/, agents/, ...)."""
+    return [ORCH_DIR / "__pycache__", *ORCH_DIR.glob("*/__pycache__")]
 
 
 def Documents(folder: Path) -> list[Path]:
@@ -63,7 +66,7 @@ def Reset(lines: list[str]) -> None:
         document.unlink()
     for path in RunDirs():
         shutil.rmtree(path)
-    for folder in (WORKSPACE_DIR, CACHE_DIR):  # leftovers of an aborted run, and Python caches
+    for folder in (WORKTREES_DIR, *CacheDirs()):  # leftovers of an aborted run, and Python caches
         shutil.rmtree(folder, ignore_errors=True)
     WriteLines(TASKS_FILE, lines[:TaskListStart(lines)])
 

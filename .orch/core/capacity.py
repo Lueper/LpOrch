@@ -5,7 +5,7 @@ import ctypes
 import os
 import sys
 
-AGENT_MEMORY_GB = 0.5  # rough footprint of one claude CLI process plus the tools it spawns
+AGENT_MEMORY_GB = 0.5  # rough footprint of one agent CLI process (claude or gemini) plus the tools it spawns
 MAX_PARALLEL = 8  # beyond this, API rate limits dominate and returns diminish
 
 

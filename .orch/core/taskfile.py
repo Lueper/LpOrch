@@ -7,12 +7,19 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from tasks import MODE_FULL, MODE_STANDARD, STATUS_PENDING, Task, TaskFileError
+from core.tasks import MODE_FULL, MODE_STANDARD, STATUS_PENDING, Task, TaskFileError
 
 # "- [ ] [doc] title" / "- [x] [code:refactorer] title" / "- [ ] [sys] title"
+# Spaces between the parts are optional, "[]" or no checkbox at all is pending, and case is ignored:
+# "-[doc]title", "- [][Doc] title" and "- [ ] [doc] title" are the same task (UpdateTaskStatus writes the last form)
 TASK_PATTERN = re.compile(
-    r"^- \[(?P<status>[ x~!])\] \[(?P<kind>doc|code|sys)(?::(?P<role>[\w-]+))?\] (?P<title>.+?)\s*$"
+    r"^-\s*(?:\[\s*(?P<status>[x~!])?\s*\]\s*)?\[(?P<kind>doc|code|sys)(?::(?P<role>[\w-]+))?\]\s*(?P<title>\S.*?)\s*$",
+    re.IGNORECASE,
 )
+# Lines that look like a task but are not one ("- [ ] [docs] x", "* [ ] [doc] x", "- [ ] [doc]" with no title):
+# reported by UnreadTaskLines instead of being left out silently
+NEAR_TASK_PATTERN = re.compile(r"^\s*(?:[-*+]\s*\[[^\]]{0,3}\]|(?:[-*+]\s*)?\[\s*(?:doc|code|sys))", re.IGNORECASE)
+COMMENT_MARKER = re.compile(r"<!--|-->")  # the header's examples sit inside <!-- -->
 # Indented lines right below a task carry its detailed instructions
 DETAIL_PATTERN = re.compile(r"^(?:\s{2,}|\t)(?P<text>\S.*?)\s*$")
 # Detail lines that configure the task instead of describing it
@@ -39,6 +46,11 @@ def WriteLines(path: Path, lines: list[str]) -> None:
 
 # ---------- parsing ----------
 
+def TaskStatus(match: re.Match) -> str:
+    """A task line's status marker; "[ ]", "[]" and a missing checkbox are all pending, "[X]" is done."""
+    return (match["status"] or STATUS_PENDING).lower()
+
+
 def ParseTasks(path: Path) -> list[Task]:
     if not path.is_file():
         raise TaskFileError(f"Task file not found: {path}")
@@ -50,11 +62,11 @@ def ParseTasks(path: Path) -> list[Task]:
         if match:
             current = Task(
                 id=f"T{len(tasks) + 1:02d}",
-                kind=match["kind"],
+                kind=match["kind"].lower(),  # "[Doc]" is a doc task
                 role=match["role"],
                 title=match["title"],
                 lineNo=lineNo,
-                status=match["status"],
+                status=TaskStatus(match),
             )
             tasks.append(current)
             continue
@@ -64,6 +76,29 @@ def ParseTasks(path: Path) -> list[Task]:
             continue
         current = None
     return tasks
+
+
+def UnreadTaskLines(path: Path) -> list[str]:
+    """Warnings for lines that look like a task but are not read as one; ParseTasks skips them without a word.
+    Lines inside <!-- --> comments and detail lines of a task are not checked."""
+    warnings = []
+    inComment = inTask = False
+    for lineNo, line in enumerate(ReadLines(path), start=1):
+        text = line.rstrip("\r\n")
+        markers = COMMENT_MARKER.findall(text)
+        commented = inComment or bool(markers)
+        inComment = markers[-1] == "<!--" if markers else inComment
+        if TASK_PATTERN.match(text):
+            inTask = True
+            continue
+        if inTask and DETAIL_PATTERN.match(text):  # same rule as ParseTasks: a detail line of the task above
+            continue
+        inTask = False
+        if not commented and NEAR_TASK_PATTERN.match(text):
+            warnings.append(
+                f"{path.name} line {lineNo} is not read as a task (expected: - [ ] [doc|code|sys] <title>): {text.strip()}"
+            )
+    return warnings
 
 
 def AddDetail(task: Task, text: str) -> None:
@@ -143,7 +178,7 @@ def FindTaskLine(lines: list[str], task: Task) -> int | None:
         if lineNo >= len(lines):
             continue
         match = TASK_PATTERN.match(lines[lineNo].rstrip("\r\n"))
-        if match and match["title"] == task.title and match["status"] == task.status:
+        if match and match["title"] == task.title and TaskStatus(match) == task.status:
             return lineNo
     return None
 
@@ -155,10 +190,18 @@ def LocateTask(lines: list[str], path: Path, task: Task) -> int:
     return lineNo
 
 
+def StandardTaskLine(match: re.Match, status: str) -> str:
+    role = f":{match['role']}" if match["role"] else ""
+    return f"- [{status}] [{match['kind'].lower()}{role}] {match['title']}"
+
+
 def UpdateTaskStatus(path: Path, task: Task, status: str) -> None:
     lines = ReadLines(path)
     lineNo = LocateTask(lines, path, task)
-    lines[lineNo] = lines[lineNo].replace(f"- [{task.status}]", f"- [{status}]", 1)
+    # The whole line is rewritten in the standard form, so "-[doc]title" gets its checkbox and spacing;
+    # kind and role come from the line itself, keeping edits made mid-run
+    match = TASK_PATTERN.match(lines[lineNo].rstrip("\r\n"))
+    lines[lineNo] = StandardTaskLine(match, status) + LineEnding(lines[lineNo])
     WriteLines(path, lines)
     task.status = status
     task.lineNo = lineNo

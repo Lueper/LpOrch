@@ -5,9 +5,10 @@ from __future__ import annotations
 
 import json
 
-from runner import AgentSpec, LoadPrompt, RunAgent, RunContext, WriteText
-from context import TaskContext
-from tasks import MAX_PARTS, Part, Task
+from agents.runner import AgentSpec, LoadPrompt, RunAgent, WriteText
+from core.context import TaskContext
+from core.runcontext import RunContext
+from core.tasks import MAX_PARTS, Part, Task
 
 PLAN_SCHEMA = {
     "type": "object",
@@ -40,7 +41,7 @@ async def PlanTask(task: Task, ctx: RunContext) -> None:
         cwd=ctx.repoRoot if task.kind == "code" and ctx.repoRoot else ctx.projectDir,
         systemAppend=LoadPrompt("planner"),
         addDirs=task.refDirs,
-        outputFormat={"type": "json_schema", "schema": PLAN_SCHEMA},
+        schema=PLAN_SCHEMA,
     )
     result = await RunAgent(f"{task.id} plan", PlanPrompt(task), spec, ctx)
     task.costUsd += result.costUsd

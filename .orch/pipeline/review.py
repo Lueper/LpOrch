@@ -10,11 +10,12 @@ import json
 from pathlib import Path
 from typing import Awaitable, Callable
 
-from phases import Clip, PartList
-from report import CheckText, FindingLines, RenderReview
-from runner import AgentResult, AgentSpec, LoadPrompt, LoadSkill, RunAgent, RunContext, WriteText
-from context import TaskContext
-from tasks import AssignReviewers, Part, Task, TaskNeedsRevision
+from agents.runner import AgentResult, AgentSpec, LoadPrompt, LoadSkill, RunAgent, WriteText
+from core.context import TaskContext
+from core.runcontext import RunContext
+from core.tasks import AssignReviewers, Part, Task, TaskNeedsRevision
+from pipeline.phases import Clip, PartList
+from reporting.report import CheckText, FindingLines, RenderReview
 
 # Optional project skills added to the code review rubric; missing files are skipped
 CODE_RUBRIC = ["develop/reviewer.md", "common/conventions.md", "common/security.md", "common/performance.md"]
@@ -37,7 +38,6 @@ REVIEW_SCHEMA = {
     },
     "required": ["verdict", "summary", "findings"],
 }
-REVIEW_FORMAT = {"type": "json_schema", "schema": REVIEW_SCHEMA}
 VERIFY_RULES = (
     "For every CRITICAL and WARNING finding above, and every failed check, decide whether the current output "
     "resolves it, or the author rejected it with a convincing reason. Report as findings only (a) items still "
@@ -63,7 +63,7 @@ def ReviewerSpec(task: Task, cwd: Path, addDirs: list[Path], resume: str | None 
         resume=resume,
         fork=resume is not None,  # fork so the peer's own session stays clean for its revision
         addDirs=[*addDirs, *task.refDirs],  # refs outside the project stay readable for fidelity checks
-        outputFormat=REVIEW_FORMAT,
+        schema=REVIEW_SCHEMA,
     )
 
 
@@ -161,7 +161,9 @@ def ReviewPrompt(part: Part, peer: Part | None, ctx: RunContext) -> str:
 def OutputForReview(part: Part, ctx: RunContext) -> str:
     partDir = ctx.TaskDir(part.id)
     if part.kind == "doc":
-        return Clip(partDir / "output.md")
+        notes = partDir / "notes.md"  # assumptions are kept out of the document but still worth judging
+        assumptions = f"\n\n=== THE AUTHOR'S ASSUMPTIONS (not part of the document) ===\n{Clip(notes)}" if notes.is_file() else ""
+        return Clip(partDir / "output.md") + assumptions
     return f"Worker summary:\n{Clip(partDir / 'notes.md')}\n\nDiff against base:\n{Clip(partDir / 'output.diff')}"
 
 

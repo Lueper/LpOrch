@@ -8,12 +8,10 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import TYPE_CHECKING, Union
+from typing import Union
 
-from tasks import NeedsRevision, Part, Task
-
-if TYPE_CHECKING:  # type-only import keeps this module free of the SDK dependency
-    from runner import RunContext
+from core.runcontext import RunContext
+from core.tasks import NeedsRevision, Part, Task
 
 SEVERITIES = ("CRITICAL", "WARNING", "INFO")
 Subject = Union[Part, Task]

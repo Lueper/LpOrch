@@ -63,7 +63,7 @@ class Task:
     error: str | None = None
     blocked: bool = False  # an upstream task did not succeed; the task goes back to pending
     result: str = ""  # where the merged result went, for the summary
-    reportRef: str = ""  # Korean progress report of a code task, written when the run ends (progress.py), for the summary
+    reportRef: str = ""  # Korean progress report, written when the run ends (reporting/progress.py), for the summary
     notes: list[str] = field(default_factory=list)
     finished: bool = False
     doneEvent: asyncio.Event = field(default_factory=asyncio.Event, repr=False)  # downstream tasks wait on it
