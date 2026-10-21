@@ -309,53 +309,19 @@ claude와 gemini는 interface가 같은 backend로 대칭 구성됨.
 
 ```
 .
-├── orch.bat               # orch 실행 런처, Windows (PowerShell: .\orch)
-├── orch.sh                # orch 실행 런처, macOS/Linux (./orch.sh)
-├── orch-reset.bat         # doc/*.md, report/*.md, 런 로그, TASKS.md 작업 목록 초기화 (Notion 행은 유지), Windows
-├── orch-reset.sh          # orch-reset.bat의 macOS/Linux판 (./orch-reset.sh)
-├── .gitattributes         # 줄바꿈 고정: *.sh LF, *.bat CRLF
-├── TASKS.md               # 작업 목록 (사람이 직접 작성; Notion 소스일 때는 그 행들의 캐시)
-├── orch.toml              # 실행 옵션 기본값, 작업 목록 소스, 역할별 provider/model
-├── CLAUDE.md              # Claude Code 전역 규칙
-├── README.md              # 이 문서
-├── doc/                   # doc 작업 결과물
-├── report/                # Task별 진행 보고 (code·doc·sys)
-├── .orch/                 # 오케스트레이터 본체 (Python, 패키지는 위쪽 패키지만 import함)
-│   ├── orchestrate.py     # 진입점 (orch run / preview)
-│   ├── reset.py           # 진입점 (orch-reset)
-│   ├── core/              # SDK-free 기반
-│   │   ├── paths.py       # 프로젝트 경로, 산출물 파일명(doc/·report/)
-│   │   ├── providers.py   # provider registry (기본값, retry 상한, preview 안내, backend 모듈)
-│   │   ├── config.py      # orch.toml 로드·검증, 작업 목록 소스, 역할별 provider/model 결정
-│   │   ├── runcontext.py  # run 전체가 공유하는 상태 (RunContext)
-│   │   ├── tasks.py / taskfile.py  # Task/Part/FollowUp 모델, TASKS.md 파싱·기록
-│   │   ├── tasksource.py  # 작업 목록 소스 하나의 interface (TASKS.md | Notion)
-│   │   ├── notion.py      # Notion 데이터베이스 읽기·쓰기 (REST API, urllib)
-│   │   ├── context.py     # ref 자료, 선행 결과, 프롬프트 context
-│   │   └── capacity.py    # 자동 병렬 수 결정
-│   ├── workspace/
-│   │   ├── gitops.py      # code 작업용 git worktree 관리
-│   │   └── sandbox.py     # sys 작업용 샌드박스, 자동 체크
-│   ├── agents/
-│   │   ├── runner.py      # provider 중립 에이전트 호출 (AgentSpec, AgentResult, RunAgent)
-│   │   ├── claude.py      # Claude backend (claude_agent_sdk)
-│   │   ├── gemini.py      # Gemini backend (Gemini CLI headless)
-│   │   └── gemini_guard.py  # Gemini 쓰기·shell 호출에 .claude 보안 규칙 적용하는 hook
-│   ├── reporting/
-│   │   ├── report.py      # 리뷰 상태·gating, summary.md, 선행 Task 리뷰 이력
-│   │   └── progress.py    # Task별 한국어 진행 보고 생성
-│   ├── pipeline/
-│   │   ├── taskflow.py    # Task 1개의 전체 흐름 (upstream 대기 → plan → work → review → merge)
-│   │   ├── planning.py    # mode: full Part 분할
-│   │   ├── phases.py      # workspace 준비, 작업, 수정, 자동 체크
-│   │   ├── review.py      # ring review, verify, 통합 리뷰
-│   │   └── merge.py       # Part 병합, 결과 반영 (doc 작성, code staging, sys 적용)
-│   ├── prompts/           # 역할별(worker/reviewer/merger/namer/reporter) 프롬프트
-│   └── runs/              # 실행별 로그/리뷰/요약 (git에는 미포함)
-└── .claude/
-    ├── settings.json      # 권한(allow/deny), 안전 훅 설정
-    ├── hooks/              # 위험 명령·sensitive 파일 차단 훅
-    └── skills/
-        ├── common/        # 모든 작업에 공통 적용되는 가이드라인
-        └── develop/        # 역할별 스킬 (refactorer, reviewer, tester 등)
+├── orch.bat / orch.sh              # 실행 런처 (Windows / macOS·Linux)
+├── orch-reset.bat / orch-reset.sh  # 실행 기록·작업 목록 초기화
+├── TASKS.md                        # 작업 목록
+├── orch.toml                       # Config 설정
+├── CLAUDE.md                       # Claude Code 전역 규칙
+├── doc/                            # doc 작업 결과물
+├── report/                         # Task별 진행 보고
+└── .orch/                          # 오케스트레이터 패키지
+   ├── core/                       # 설정, 작업 목록, Task 모델
+   ├── workspace/                  # git worktree, sys 샌드박스
+   ├── agents/                     # provider별 에이전트 호출 (Claude, Gemini)
+   ├── reporting/                  # 리뷰 집계, summary, 진행 보고
+   ├── pipeline/                   # Plan → Work → Review → Merge
+   ├── prompts/                    # 역할별 프롬프트
+   └── runs/                       # 실행별 로그 (git 미포함)
 ```
