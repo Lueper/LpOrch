@@ -20,6 +20,13 @@ DOC_DIR_NAME = "doc"  # doc deliverables
 REPORT_DIR_NAME = "report"  # progress reports, kept apart from the doc deliverables
 INVALID_FILENAME_CHARS = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
 MAX_TITLE_CHARS = 40
+# Files the file manager leaves in any folder (Finder, Explorer), lower case: never task material or system files
+OS_METADATA_FILES = frozenset({".ds_store", "thumbs.db", "desktop.ini"})
+APPLE_DOUBLE_PREFIX = "._"  # macOS writes "._<name>" next to each file on FAT, exFAT and SMB volumes
+
+
+def IsOsMetadata(name: str) -> bool:
+    return name.lower() in OS_METADATA_FILES or name.startswith(APPLE_DOUBLE_PREFIX)
 
 
 def SanitizeTitle(title: str) -> str:

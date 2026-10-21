@@ -3,10 +3,16 @@ from __future__ import annotations
 
 import ctypes
 import os
+import re
+import subprocess
 import sys
 
 AGENT_MEMORY_GB = 0.5  # rough footprint of one agent CLI process (claude or gemini) plus the tools it spawns
 MAX_PARALLEL = 8  # beyond this, API rate limits dominate and returns diminish
+# macOS has no SC_AVPHYS_PAGES; vm_stat reports its pages instead ("Pages free:   12345.")
+VM_STAT_PAGE_SIZE = re.compile(r"page size of (\d+) bytes")
+VM_STAT_PAGES = re.compile(r"^Pages (free|inactive|speculative):\s+(\d+)\.$", re.MULTILINE)
+VM_STAT_TIMEOUT = 10  # seconds
 
 
 class MemoryStatus(ctypes.Structure):
@@ -30,10 +36,25 @@ def FreeMemoryGb() -> float | None:
         if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
             return status.ullAvailPhys / 1024**3
         return None
+    if sys.platform == "darwin":
+        return VmStatFreeGb()
     try:
         return os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") / 1024**3
     except (AttributeError, ValueError, OSError):
         return None
+
+
+def VmStatFreeGb() -> float | None:
+    """macOS: free, inactive and speculative pages - what new processes get without swapping. None = unknown."""
+    try:
+        output = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=VM_STAT_TIMEOUT).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    pageSize = VM_STAT_PAGE_SIZE.search(output)
+    pages = dict(VM_STAT_PAGES.findall(output))
+    if not pageSize or "free" not in pages:
+        return None
+    return sum(map(int, pages.values())) * int(pageSize[1]) / 1024**3
 
 
 def AutoParallel(agentsNeeded: int) -> tuple[int, str]:

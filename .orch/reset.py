@@ -1,7 +1,7 @@
 """Reset the orchestrator's history: generated documents, run logs, the task list in TASKS.md, and caches.
 
-Usage (via the launcher at the project root):
-    orch-reset           list what will be deleted and ask first     (PowerShell: .\\orch-reset)
+Usage (via the launcher at the project root: orch-reset.bat on Windows, orch-reset.sh on macOS/Linux):
+    orch-reset           list what will be deleted and ask first     (PowerShell: .\\orch-reset, macOS/Linux: ./orch-reset.sh)
     orch-reset --yes     delete without asking
 Deletes permanently: doc/*.md (subfolders such as doc/refs/ are kept), report/*.md, .orch/runs/*,
 .orch/worktrees/*, the Python caches in .orch/ and its packages, and the task list of TASKS.md (from the first task
@@ -14,6 +14,10 @@ import argparse
 import shutil
 import sys
 from pathlib import Path
+
+# Before the imports below, which need tomllib (3.11+): macOS's own /usr/bin/python3 is older
+if sys.version_info < (3, 11):
+    sys.exit(f"error: LpOrch needs Python 3.11 or newer; {sys.executable} is {sys.version.split()[0]}")
 
 from core.config import SOURCE_NOTION, LoadConfig
 from core.paths import DOC_DIR_NAME, ORCH_DIR, PROJECT_ROOT, REPORT_DIR_NAME, RUNS_DIR, TASKS_FILE, WORKTREES_DIR

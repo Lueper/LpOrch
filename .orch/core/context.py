@@ -8,6 +8,7 @@ import glob
 import re
 from pathlib import Path
 
+from core.paths import IsOsMetadata
 from core.tasks import STATUS_DONE, SYS_APPLIED_PREFIX, Task
 
 URL_PATTERN = re.compile(r"^https?://", re.IGNORECASE)
@@ -37,16 +38,24 @@ def ResolveRefs(task: Task, projectDir: Path) -> list[str]:
 
 
 def RefFiles(entry: str, projectDir: Path) -> list[Path]:
-    """Files for one "ref:" entry: a file, a folder (all files inside) or a glob; relative to the project."""
-    text = HOME_PREFIX.sub("", entry.strip().strip('"'))
+    """Files for one "ref:" entry: a file, a folder (all files inside) or a glob; relative to the project.
+
+    "\\" separates folders as "/" does, so a task list written on Windows resolves the same on macOS.
+    """
+    text = HOME_PREFIX.sub("", entry.strip().strip('"')).replace("\\", "/")
     path = Path(text) if Path(text).is_absolute() else projectDir / text
     if path.is_file():  # literal first: names like "[T08]_x.md" are not glob patterns
         return [path.resolve()]
     if path.is_dir():
-        return sorted(item.resolve() for item in path.rglob("*") if item.is_file())
+        return sorted(item.resolve() for item in path.rglob("*") if IsMaterial(item))
     if GLOB_CHARS.search(text):
-        return sorted(Path(item).resolve() for item in glob.glob(str(path), recursive=True) if Path(item).is_file())
+        return sorted(Path(item).resolve() for item in glob.glob(str(path), recursive=True) if IsMaterial(Path(item)))
     return []
+
+
+def IsMaterial(path: Path) -> bool:
+    # A folder or glob ref leaves out what Finder or Explorer put there (.DS_Store, Thumbs.db, ...)
+    return path.is_file() and not IsOsMetadata(path.name)
 
 
 def RefLabel(path: Path, projectDir: Path) -> str:

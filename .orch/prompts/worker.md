@@ -41,9 +41,10 @@ Every request of this session re-reads everything already in it, so what you pul
 - Final message: a short summary with files changed, rationale, test results, and assumptions.
 
 ## Sys Tasks (changing the orchestrator itself)
-- You are in a sandbox copy of the orchestrator's own files: `.orch/` (code and prompts), `.claude/` (skills, hooks, settings), `CLAUDE.md`, `README.md`, `TASKS.md`, `orch.bat`, `orch-reset.bat`. Edit them in place.
+- You are in a sandbox copy of the orchestrator's own files: `.orch/` (code and prompts), `.claude/` (skills, hooks, settings), `CLAUDE.md`, `README.md`, `TASKS.md`, `orch.toml`, and the launchers `orch.bat`, `orch-reset.bat` (Windows) and `orch.sh`, `orch-reset.sh` (macOS/Linux). Edit them in place.
 - Only files in that scope are applied; anything else you create is ignored. Never edit the real project outside this sandbox.
-- After every change the orchestrator compiles and imports every Python module under `.orch/` (its packages included), runs `python .orch/orchestrate.py preview`, and parses JSON settings. Fix what fails. You may run these yourself.
+- After every change the orchestrator compiles and imports every Python module under `.orch/` (its packages included), runs `.orch/orchestrate.py preview`, and parses JSON settings. Fix what fails. You may run these yourself (`python` on Windows, `python3` on macOS/Linux).
+- LpOrch runs on Windows and macOS alike. Change both launchers of a pair together (`orch.bat` with `orch.sh`, `orch-reset.bat` with `orch-reset.sh`); `.sh` files keep LF line endings. Keep `.orch/` code OS-neutral: `pathlib` paths, subprocess argument lists instead of shell strings, and a `sys.platform` branch only where the OSes really differ.
 - `.orch/` packages import only the ones before them: `core/` -> `workspace/` -> `agents/` -> `reporting/` -> `pipeline/`. Provider-specific code stays in its backend (`agents/claude.py`, `agents/gemini.py`) and its registry entry (`core/providers.py`).
 - Never run the orchestrator except with `preview`: a plain run would start real agents.
 - Do not change task status markers in `TASKS.md`; the orchestrator manages them. Updating its header comment is fine.

@@ -26,23 +26,21 @@ provider = "claude"         # every role without its own provider below: claude 
 # Setup: create an internal integration (notion.so/my-integrations), invite it to the database
 # (Share -> Connections), put its secret in the NOTION_TOKEN environment variable - never in this file -
 # and check with "orch preview" before the first run.
+
+[tasks]
+source = "file"             # where the task list lives: "file" = TASKS.md, "notion" = the database below
+# source = "notion"             # where the task list lives: "file" = TASKS.md, "notion" = the database below
+# follow_ups = true           # a succeeded task may add the follow-up tasks its agents asked for to the task list
+                            # (new pending tasks at the end, at most 5 per task)
+                            # false = agents are not asked for them and nothing is written to the list
+
 # [notion]
 # database = ""             # the database link ("Copy link") or its 32-character id; the "?v=" view id is ignored
 # token_env = "NOTION_TOKEN"  # environment variable holding the integration token
 
-[tasks]
-# source = "file"             # where the task list lives: "file" = TASKS.md, "notion" = the database below
-source = "notion"             # where the task list lives: "file" = TASKS.md, "notion" = the database below
-follow_ups = true           # a succeeded task may add the follow-up tasks its agents asked for to the task list
-                            # (new pending tasks at the end, at most 5 per task)
-                            # false = agents are not asked for them and nothing is written to the list
-
-[notion]
-database = "https://app.notion.com/p/3f39a5ea322980579eaed7aa90c48205"             # the database link ("Copy link") or its 32-character id; the "?v=" view id is ignored
-token_env = "NOTION_TOKEN"  # environment variable holding the integration token
 
 [claude]
-model = "claude-opus-5-5"   # main model, alias or ID (e.g. "opus", "sonnet"); "" = the CLI's default
+model = "opus"   # main model, alias or ID (e.g. "opus", "sonnet"); "" = the CLI's default
 small_model = "haiku"       # namer and reporter: one-shot chores; "" = same as model
 cli_path = ""               # native claude executable; "" = auto-detect (npm installs included)
 # max_retries = 10          # retries of a failed API request (429, 529, network); unset = the CLI's default (10)

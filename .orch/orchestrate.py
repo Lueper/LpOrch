@@ -7,8 +7,8 @@ When the run ends, every task that ran (sys tasks too) gets a Korean progress re
 for every kind but doc, whose result is its document in doc/, the task list's result line then points at that report.
 
 Lives in <project>/.orch/ and always works on <project>, the folder that contains .orch/.
-Usage (via the launcher at the project root):
-    orch                 run the pending tasks in TASKS.md      (PowerShell: .\\orch)
+Usage (via the launcher at the project root: orch.bat on Windows, orch.sh on macOS/Linux):
+    orch                 run the pending tasks in TASKS.md      (PowerShell: .\\orch, macOS/Linux: ./orch.sh)
     orch preview         show tasks, reviewer pairs and the agent count without running anything
 Options: [--max-parallel N] [--max-rounds N] [--budget-per-agent USD] [--max-turns N]
          [--provider claude|gemini] [--model NAME] [--cli-path PATH] [--source file|notion]
@@ -33,6 +33,10 @@ import shutil
 import sys
 from datetime import datetime
 from pathlib import Path
+
+# Before the imports below, which need tomllib (3.11+): macOS's own /usr/bin/python3 is older
+if sys.version_info < (3, 11):
+    sys.exit(f"error: LpOrch needs Python 3.11 or newer; {sys.executable} is {sys.version.split()[0]}")
 
 from agents.runner import CONSOLE_TEXT
 from core.capacity import AutoParallel

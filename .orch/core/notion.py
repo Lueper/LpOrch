@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import ssl
 import time
 import urllib.error
 import urllib.request
@@ -42,6 +43,11 @@ REQUEST_TIMEOUT = 20  # seconds per API request
 RETRY_STATUSES = {429, 500, 502, 503, 504}  # rate limits and Notion-side hiccups are worth another attempt
 MAX_ATTEMPTS = 3
 RETRY_WAIT = 2.0  # seconds, multiplied by the attempt number
+# The python.org installer for macOS leaves Python without CA certificates until this script has run once
+CERTIFICATE_HINT = (
+    "; Python cannot verify Notion's certificate - on macOS with the python.org installer, run"
+    ' "Install Certificates.command" in /Applications/Python 3.x once'
+)
 PAGE_SIZE = 100  # rows per query request (the API's maximum)
 MAX_TEXT_CHARS = 2000  # the API's limit per text chunk; titles and detail blocks written here stay well below
 MAX_ROWS = 500  # stop reading there instead of pulling an unexpectedly huge database into every prompt
@@ -116,11 +122,18 @@ def Request(method: str, path: str, token: str, payload: dict | None = None) -> 
                 continue
             raise NotionError(f"Notion API {method} {path}: {error.code} {ErrorMessage(error)}", error.code) from error
         except (urllib.error.URLError, OSError, ValueError) as error:  # network down, timeout, broken JSON
-            if attempt < MAX_ATTEMPTS:
+            untrusted = UntrustedCertificate(error)
+            if attempt < MAX_ATTEMPTS and not untrusted:  # a certificate Python cannot verify fails the same again
                 time.sleep(RETRY_WAIT * attempt)
                 continue
-            raise NotionError(f"Notion API {method} {path}: {error}") from error
+            hint = CERTIFICATE_HINT if untrusted else ""
+            raise NotionError(f"Notion API {method} {path}: {error}{hint}") from error
     raise NotionError(f"Notion API {method} {path}: no response after {MAX_ATTEMPTS} attempts")
+
+
+def UntrustedCertificate(error: Exception) -> bool:
+    # urlopen wraps the SSL error in a URLError; a failed read raises it as it is
+    return any(isinstance(item, ssl.SSLCertVerificationError) for item in (error, getattr(error, "reason", None)))
 
 
 def RetryWait(error: urllib.error.HTTPError, attempt: int) -> float:

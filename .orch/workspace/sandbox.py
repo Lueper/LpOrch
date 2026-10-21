@@ -15,10 +15,15 @@ import subprocess
 import sys
 from pathlib import Path
 
+from core.paths import IsOsMetadata
+
 # The system a [sys] task may change
 SCOPE_DIRS = (".orch", ".claude")
-# orch.toml: checked by preview. README.md documents this orchestrator, so a [sys] task keeps it in sync
-SCOPE_FILES = ("CLAUDE.md", "README.md", "TASKS.md", "orch.toml", "orch.bat", "orch-reset.bat")
+# orch.toml: checked by preview. README.md documents this orchestrator, so a [sys] task keeps it in sync.
+# The launchers come in pairs: .bat for Windows, .sh for macOS/Linux
+SCOPE_FILES = (
+    "CLAUDE.md", "README.md", "TASKS.md", "orch.toml", "orch.bat", "orch-reset.bat", "orch.sh", "orch-reset.sh",
+)
 # Run artifacts, sandboxes, caches and local or secret files never enter a sandbox
 EXCLUDED_DIRS = {"runs", "worktrees", "__pycache__", ".pytest_cache", ".mypy_cache", ".venv"}
 EXCLUDED_FILES = {"settings.local.json"}
@@ -42,10 +47,11 @@ def InScope(relative: str) -> bool:
 
 
 def WalkFiles(root: Path):
-    """Every file under root as (relative posix path, path), skipping excluded folders."""
+    """Every file under root as (relative posix path, path), skipping excluded folders and file-manager metadata
+    (a "._x.py" AppleDouble file would otherwise be compiled by the smoke test)."""
     for folder, dirs, names in os.walk(root):
         dirs[:] = [name for name in dirs if name not in EXCLUDED_DIRS]
-        for name in names:
+        for name in (name for name in names if not IsOsMetadata(name)):
             path = Path(folder) / name
             yield path.relative_to(root).as_posix(), path
 

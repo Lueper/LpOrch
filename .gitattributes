@@ -1,0 +1,4 @@
+# Line endings fixed per file type, whatever core.autocrlf says on the machine that checks them out:
+# sh/bash reject CRLF (the macOS/Linux launchers, .claude/hooks), and cmd.exe expects CRLF in batch files
+*.sh  text eol=lf
+*.bat text eol=crlf
