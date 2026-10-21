@@ -1,7 +1,8 @@
 """The agent providers: what settings, preview and the runner need to know about each one. SDK-free.
 
-Every provider has a backend module in agents/ with the same entry point,
+Every provider has a backend module in agents/ with the same interface,
     async def Run(label, prompt, spec, ctx, model) -> AgentResult
+    TRANSIENT_ERROR: re.Pattern  - its errors worth another attempt (connection dropped, API overloaded)
 imported on its first call, so a provider no role uses needs neither its SDK nor its CLI.
 Adding a provider = an entry here (orch.toml then accepts its [<name>] section) + its backend module.
 """

@@ -13,10 +13,12 @@ from typing import Awaitable, Callable
 from agents.runner import AgentResult, AgentSpec, LoadPrompt, LoadSkill, RunAgent, WriteText
 from core.context import TaskContext
 from core.runcontext import RunContext
-from core.tasks import AssignReviewers, Part, Task, TaskNeedsRevision
-from pipeline.phases import Clip, PartList
+from core.tasks import AssignReviewers, Part, Task, TaskId, TaskNeedsRevision
+from pipeline.phases import Clip, FollowUpText, PartList
+from reporting.progress import DiffStat
 from reporting.report import CheckText, FindingLines, RenderReview
 
+REVIEW_DIFF_CHARS = 30_000  # diff a review prompt carries inline; a longer one is cut, its rest read from the file
 # Optional project skills added to the code review rubric; missing files are skipped
 CODE_RUBRIC = ["develop/reviewer.md", "common/conventions.md", "common/security.md", "common/performance.md"]
 FINDING_SCHEMA = {
@@ -160,11 +162,38 @@ def ReviewPrompt(part: Part, peer: Part | None, ctx: RunContext) -> str:
 
 def OutputForReview(part: Part, ctx: RunContext) -> str:
     partDir = ctx.TaskDir(part.id)
+    # Follow-up tasks are written into the task list unreviewed otherwise, so the reviewer gets them too
+    followUps = f"\n\n{FollowUpText(part)}" if part.followUps else ""
+    if part.kind == "task":  # the list is the result: judged against the task list it is added to
+        notes = partDir / "notes.md"
+        assumptions = f"\n\n=== THE AUTHOR'S ASSUMPTIONS (not part of the list) ===\n{Clip(notes)}" if notes.is_file() else ""
+        intro = (f"=== TASKS TO ADD TO THE TASK LIST (new IDs from {TaskId(ctx.nextTaskNumber)} in list order;"
+                 " the current task list is TASKS.md in the project) ===")
+        return f"{intro}\n{Clip(partDir / 'output.md')}{assumptions}"
+    if part.kind == "test":  # the copy is discarded, so the report and the list of changed files are all that remain
+        return f"Test report:\n{Clip(partDir / 'notes.md')}\n\n{Clip(partDir / 'changes.md')}" + followUps
     if part.kind == "doc":
         notes = partDir / "notes.md"  # assumptions are kept out of the document but still worth judging
         assumptions = f"\n\n=== THE AUTHOR'S ASSUMPTIONS (not part of the document) ===\n{Clip(notes)}" if notes.is_file() else ""
-        return Clip(partDir / "output.md") + assumptions
-    return f"Worker summary:\n{Clip(partDir / 'notes.md')}\n\nDiff against base:\n{Clip(partDir / 'output.diff')}"
+        return Clip(partDir / "output.md") + assumptions + followUps
+    return (
+        f"Worker summary:\n{Clip(partDir / 'notes.md')}\n\nDiff against base:\n{DiffForReview(partDir / 'output.diff')}"
+        + followUps
+    )
+
+
+def DiffForReview(path: Path) -> str:
+    """The diff as a review prompt carries it: whole when short; else the changed files with their line counts and
+    the head of the diff, the rest left in the file - the prompt stays in a reviewer's context for every request."""
+    text = path.read_text(encoding="utf-8")
+    if len(text) <= REVIEW_DIFF_CHARS:
+        return text
+    return "\n\n".join([
+        DiffStat(text),
+        text[:REVIEW_DIFF_CHARS],
+        f"[diff cut after {REVIEW_DIFF_CHARS} of {len(text)} characters - the rest is in {path}: read the hunks of"
+        " the files listed above that are not shown, with Read offset/limit, before judging them]",
+    ])
 
 
 async def VerifyParts(parts: list[Part], ctx: RunContext, roundNo: int) -> None:

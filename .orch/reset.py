@@ -5,7 +5,8 @@ Usage (via the launcher at the project root):
     orch-reset --yes     delete without asking
 Deletes permanently: doc/*.md (subfolders such as doc/refs/ are kept), report/*.md, .orch/runs/*,
 .orch/worktrees/*, the Python caches in .orch/ and its packages, and the task list of TASKS.md (from the first task
-line on; the header comment stays).
+line on; the header comment stays). A Notion task list ([tasks] source = "notion") is only pointed out, never
+touched - its rows are the user's data, and TASKS.md is then just their cache, rebuilt by the next run or preview.
 """
 from __future__ import annotations
 
@@ -14,17 +15,13 @@ import shutil
 import sys
 from pathlib import Path
 
+from core.config import SOURCE_NOTION, LoadConfig
 from core.paths import DOC_DIR_NAME, ORCH_DIR, PROJECT_ROOT, REPORT_DIR_NAME, RUNS_DIR, TASKS_FILE, WORKTREES_DIR
-from core.taskfile import TASK_PATTERN, ReadLines, TaskStatus, WriteLines
+from core.taskfile import TASK_PATTERN, ReadLines, TaskListStart, TaskStatus, WriteLines
 from core.tasks import STATUS_RUNNING
 
 DOC_DIR = PROJECT_ROOT / DOC_DIR_NAME
 REPORT_DIR = PROJECT_ROOT / REPORT_DIR_NAME  # progress reports (reporting/progress.py)
-
-
-def TaskListStart(lines: list[str]) -> int:
-    """Index of the first task line; everything before it (header comment, title) is kept."""
-    return next((index for index, line in enumerate(lines) if TASK_PATTERN.match(line.rstrip("\r\n"))), len(lines))
 
 
 def RunInProgress(lines: list[str]) -> str | None:
@@ -61,6 +58,16 @@ def Plan(lines: list[str]) -> dict[str, int]:
     }
 
 
+def NotionNotice() -> str | None:
+    """A reset only deletes local files, so a Notion task list is left exactly as it is."""
+    config, _ = LoadConfig(PROJECT_ROOT)  # settings problems are the run's business, not the reset's
+    if config.taskSource != SOURCE_NOTION:
+        return None
+    return ('note: the tasks come from a Notion database ([tasks] source = "notion" in orch.toml);'
+            " its rows keep their status and results - delete them in Notion if you want them gone."
+            " TASKS.md only caches them and gets them back on the next run or preview")
+
+
 def Reset(lines: list[str]) -> None:
     for document in Documents(DOC_DIR) + Documents(REPORT_DIR):
         document.unlink()
@@ -83,8 +90,11 @@ def Main(argv: list[str] | None = None) -> int:
         print(f"error: an orchestrator run seems to be in progress ({busy}); reset after it finishes", file=sys.stderr)
         return 2
     plan = Plan(lines)
+    notice = NotionNotice()
     if not any(plan.values()):
         print("Nothing to reset.")
+        if notice:
+            print(notice)
         return 0
     print("This permanently deletes:")
     for label, count in plan.items():
@@ -93,6 +103,8 @@ def Main(argv: list[str] | None = None) -> int:
         "  (kept: .orch code and prompts, .claude/, CLAUDE.md, orch.toml, the TASKS.md header,"
         " folders inside doc/ and report/)"
     )
+    if notice:
+        print(notice)
     if not args.yes and input("Delete? [y/N] ").strip().lower() not in ("y", "yes"):
         print("Cancelled.")
         return 1

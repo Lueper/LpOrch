@@ -24,6 +24,7 @@ class RunContext:
     semaphore: asyncio.Semaphore
     gitLock: asyncio.Lock = field(default_factory=asyncio.Lock)  # tasks share one repository
     systemBase: Path | None = None  # snapshot of the system files that [sys] sandboxes start from
+    nextTaskNumber: int = 1  # the task list's next free ID when the run started; [task] workers number from it
 
     def TaskDir(self, taskId: str) -> Path:
         path = self.runDir / taskId

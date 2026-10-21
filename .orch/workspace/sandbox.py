@@ -1,4 +1,5 @@
-"""[sys] task workspaces: copies of the orchestrator's own files, diffs, 3-way apply, and automated checks.
+"""[sys] task workspaces: copies of the orchestrator's own files, diffs, 3-way apply, and automated checks;
+and the disposable copies of the whole project that [test] tasks run in.
 
 Plain file copies plus `git merge-file` (which needs no repository), so [sys] tasks work
 whether or not the project is a git repo. SDK-free.
@@ -16,11 +17,16 @@ from pathlib import Path
 
 # The system a [sys] task may change
 SCOPE_DIRS = (".orch", ".claude")
-SCOPE_FILES = ("CLAUDE.md", "TASKS.md", "orch.toml", "orch.bat", "orch-reset.bat")  # orch.toml: checked by preview
+# orch.toml: checked by preview. README.md documents this orchestrator, so a [sys] task keeps it in sync
+SCOPE_FILES = ("CLAUDE.md", "README.md", "TASKS.md", "orch.toml", "orch.bat", "orch-reset.bat")
 # Run artifacts, sandboxes, caches and local or secret files never enter a sandbox
 EXCLUDED_DIRS = {"runs", "worktrees", "__pycache__", ".pytest_cache", ".mypy_cache", ".venv"}
 EXCLUDED_FILES = {"settings.local.json"}
 EXCLUDED_SUFFIXES = {".pyc", ".log"}
+# A [test] copy of the project leaves out git's own data and caches, and the orchestrator's run artifacts -
+# the copy itself is made under .orch/worktrees/
+PROJECT_COPY_SKIPPED = {".git", "__pycache__", ".pytest_cache", ".mypy_cache"}
+ORCH_ARTIFACT_DIRS = (Path(".orch") / "runs", Path(".orch") / "worktrees")
 CHECK_TIMEOUT = 120  # seconds per built-in check
 VERIFY_TIMEOUT = 600  # seconds for a task's own "verify:" command
 MAX_CHECK_OUTPUT = 4000  # tail of a failed check kept for prompts
@@ -61,6 +67,39 @@ def CreateSnapshot(projectDir: Path, dest: Path) -> Path:
 def CopyTree(source: Path, dest: Path) -> Path:
     shutil.copytree(source, dest, ignore=shutil.ignore_patterns(*EXCLUDED_DIRS))
     return dest
+
+
+def CopyProject(projectDir: Path, dest: Path) -> dict[str, tuple[int, int]]:
+    """Copy the project as it is now, uncommitted changes included, for a [test] task to work in; returns the copy's
+    files with their size and modification time, which ChangedFiles compares against."""
+    skipped = {(projectDir / relative).resolve() for relative in ORCH_ARTIFACT_DIRS}
+
+    def Ignore(folder: str, names: list[str]) -> list[str]:
+        here = Path(folder).resolve()
+        return [name for name in names if name in PROJECT_COPY_SKIPPED or here / name in skipped]
+
+    shutil.copytree(projectDir, dest, ignore=Ignore)
+    return FileStamps(dest)
+
+
+def FileStamps(root: Path) -> dict[str, tuple[int, int]]:
+    """Every file under root (caches and git data left out) with its size and modification time."""
+    stamps = {}
+    for folder, dirs, names in os.walk(root):
+        dirs[:] = [name for name in dirs if name not in PROJECT_COPY_SKIPPED]
+        for name in names:
+            path = Path(folder) / name
+            info = path.stat()
+            stamps[path.relative_to(root).as_posix()] = (info.st_size, info.st_mtime_ns)
+    return stamps
+
+
+def ChangedFiles(root: Path, stamps: dict[str, tuple[int, int]]) -> list[tuple[str, str]]:
+    """(status, path) for files a [test] worker added (A), modified (M) or deleted (D) in its copy."""
+    now = FileStamps(root)
+    changes = [("D", name) for name in stamps if name not in now]
+    changes += [("A" if name not in stamps else "M", name) for name, stamp in now.items() if stamps.get(name) != stamp]
+    return sorted(changes, key=lambda change: change[1])
 
 
 def Changes(base: Path, workspace: Path) -> list[tuple[str, str]]:
@@ -196,7 +235,8 @@ def SmokeTest(root: Path) -> list[tuple[bool, str]]:
     steps = [
         ("compile", [sys.executable, "-m", "py_compile", *(str(orch / relative) for relative in sources)]),
         ("import", [sys.executable, "-c", f"import sys; sys.path.insert(0, {str(orch)!r}); {imports}"]),
-        ("preview", [sys.executable, str(orch / "orchestrate.py"), "preview"]),
+        # --source file: the checks read the sandbox's TASKS.md, never a Notion database over the network
+        ("preview", [sys.executable, str(orch / "orchestrate.py"), "preview", "--source", "file"]),
     ]
     results = []
     for name, command in steps:  # each step assumes the previous one passed

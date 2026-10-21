@@ -1,10 +1,13 @@
-"""Korean progress report per code and doc task: what the run recorded about a task - timeline, worker notes and
-assumptions, reviews, the author's responses, checks, changed files or the document's outline - summarized by the
-provider's small_model (orch.toml) once every task is final.
+"""Korean progress report per task (code, doc and sys): what the run recorded about a task - timeline, worker notes
+and assumptions, reviews, the author's responses, checks, changed files or the document's outline - summarized by
+the provider's small_model (orch.toml) once every task is final.
 
 Written to report/[Txx]_<YYMMDD>_<title>.md, apart from the doc deliverables, which hold their content only: a doc
-task's assumptions, merge notes and unresolved findings land here. Sys tasks get none, and neither do tasks blocked
-by "after:" (they did not run). When the model gives no report, the recorded facts are written as they are instead.
+task's assumptions, merge notes and unresolved findings land here. For every other kind the report is the result
+document as well: the task list's result line and "ref: Txx" point at it (orchestrate.RunPipeline).
+A sys task's report comes after the [sys] applies,
+so it says whether its changes reached the project. Tasks blocked by "after:" get none (they did not run).
+When the model gives no report, the recorded facts are written as they are instead.
 """
 from __future__ import annotations
 
@@ -19,7 +22,6 @@ from core.runcontext import RunContext
 from core.tasks import Part, Task
 from reporting.report import ROUND_NUMBER, CheckState, ReviewState, TaskStatus
 
-REPORT_KINDS = ("code", "doc")  # sys changes are backed up and diffed in the run folder
 MAX_ARTIFACT_CHARS = 8_000  # per artifact; the full files stay in the run folder
 MAX_OUTLINE_HEADINGS = 60  # a doc task's report gets the document's headings, not its text
 HEADING = re.compile(r"^#{1,6} \S")
@@ -31,8 +33,8 @@ CURRENT = 10**6  # files without ".rN." hold the final version: after every arch
 
 
 async def WriteProgressReports(tasks: list[Task], ctx: RunContext) -> None:
-    """One report per code or doc task that ran; called once every task, [sys] applies included, is final."""
-    reported = [task for task in tasks if task.kind in REPORT_KINDS and not task.blocked]
+    """One report per task that ran, sys tasks included; called once every task, [sys] applies included, is final."""
+    reported = [task for task in tasks if not task.blocked]
     await asyncio.gather(*(WriteProgressReport(task, ctx) for task in reported))
 
 
@@ -125,9 +127,14 @@ def IsTaskEvent(task: Task, line: str) -> bool:
 def Artifacts(task: Task, ctx: RunContext) -> list[str]:
     """The text artifacts of the task's part folders and its own folder, oldest round first."""
     folders = [ctx.runDir / part.id for part in task.parts] + [ctx.runDir / task.id]
+    # A sys task's sys.diff is its merged change, the one applied to the project; the parts' final output.diff
+    # would list the same files again
+    merged = task.kind == "sys" and (ctx.runDir / task.id / "sys.diff").is_file()
     blocks = []
     for folder in (path for path in folders if path.is_dir()):
         for path in sorted((path for path in folder.iterdir() if path.is_file()), key=ArtifactOrder):
+            if merged and folder.name != task.id and path.name == "output.diff":
+                continue
             text = ArtifactText(path)
             if text:
                 blocks += [f"=== {folder.name}/{path.name} ===", text]

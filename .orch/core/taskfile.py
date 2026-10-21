@@ -1,24 +1,31 @@
-"""TASKS.md: parsing task lines and their settings, linking "after:" dependencies, and writing status and results.
+"""TASKS.md: parsing task lines and their settings, linking "after:" dependencies, and writing status, results
+and the follow-up tasks agents ask for.
 
-SDK-free so `preview` works without claude_agent_sdk installed.
+The file backend of core/tasksource.py, and the cache of its Notion backend: the database's rows are written here
+(ReplaceTaskList) and the run reads and writes them like any other task line, so a task is configured and proposed
+the same way in both.
+SDK-free so `preview` works without claude_agent_sdk.
 """
 from __future__ import annotations
 
 import re
 from pathlib import Path
 
-from core.tasks import MODE_FULL, MODE_STANDARD, STATUS_PENDING, Task, TaskFileError
+from core.tasks import (
+    MODE_FULL, MODE_STANDARD, SINGLE_PART_KINDS, STATUS_PENDING, TASK_KINDS, FollowUp, Task, TaskFileError,
+)
 
+KINDS = "|".join(TASK_KINDS)  # "doc|code|sys|test|task", for the patterns below
 # "- [ ] [doc] title" / "- [x] [code:refactorer] title" / "- [ ] [sys] title"
 # Spaces between the parts are optional, "[]" or no checkbox at all is pending, and case is ignored:
 # "-[doc]title", "- [][Doc] title" and "- [ ] [doc] title" are the same task (UpdateTaskStatus writes the last form)
 TASK_PATTERN = re.compile(
-    r"^-\s*(?:\[\s*(?P<status>[x~!])?\s*\]\s*)?\[(?P<kind>doc|code|sys)(?::(?P<role>[\w-]+))?\]\s*(?P<title>\S.*?)\s*$",
+    rf"^-\s*(?:\[\s*(?P<status>[x~!])?\s*\]\s*)?\[(?P<kind>{KINDS})(?::(?P<role>[\w-]+))?\]\s*(?P<title>\S.*?)\s*$",
     re.IGNORECASE,
 )
 # Lines that look like a task but are not one ("- [ ] [docs] x", "* [ ] [doc] x", "- [ ] [doc]" with no title):
 # reported by UnreadTaskLines instead of being left out silently
-NEAR_TASK_PATTERN = re.compile(r"^\s*(?:[-*+]\s*\[[^\]]{0,3}\]|(?:[-*+]\s*)?\[\s*(?:doc|code|sys))", re.IGNORECASE)
+NEAR_TASK_PATTERN = re.compile(rf"^\s*(?:[-*+]\s*\[[^\]]{{0,3}}\]|(?:[-*+]\s*)?\[\s*(?:{KINDS}))", re.IGNORECASE)
 COMMENT_MARKER = re.compile(r"<!--|-->")  # the header's examples sit inside <!-- -->
 # Indented lines right below a task carry its detailed instructions
 DETAIL_PATTERN = re.compile(r"^(?:\s{2,}|\t)(?P<text>\S.*?)\s*$")
@@ -31,6 +38,18 @@ RESULT_ARROW = "→"
 RESULT_RUN_PATTERN = re.compile(r"^(?P<ref>.*?)\s*\(run (?P<run>\d{8}-\d{6})\)$")  # "doc/x.md (run 20261008-101500)"
 TASK_ID_PATTERN = re.compile(r"T(\d+)", re.IGNORECASE)
 TASK_REF_PATTERN = re.compile(r"^T(\d+)$", re.IGNORECASE)  # "ref: T03" = T03's result
+# An agent lists the follow-up tasks it asks for below this line in its final message (pipeline/phases.py)
+FOLLOWUP_MARKER = "=== FOLLOW-UP TASKS ==="
+SECTION_MARKER = re.compile(r"^\s*===\s.+\s===\s*$")  # the "=== X ===" lines an agent's final message is split at
+# A follow-up task line, read more leniently than a file's own: any bullet, a pasted checkbox and no bullet all count
+FOLLOWUP_PATTERN = re.compile(
+    rf"^(?:[-*+]\s*)?(?:\[\s*[x~!]?\s*\]\s*)?\[(?P<kind>{KINDS})(?::(?P<role>[\w-]+))?\]\s*(?P<title>\S.*?)\s*$",
+    re.IGNORECASE,
+)
+# A list item in a follow-up block that FOLLOWUP_PATTERN did not read ("1. [code] x", "- **[code] x**", "- x"):
+# reported instead of being dropped in silence, like UnreadTaskLines does for the file
+UNREAD_FOLLOWUP_PATTERN = re.compile(r"^(?:[-*+•]|\d+[.)])\s*\S")
+NEW_FILE_HEADER = ["# Tasks\n", "\n"]  # a task list cached into a TASKS.md that does not exist yet
 
 
 def ReadLines(path: Path) -> list[str]:
@@ -42,6 +61,27 @@ def ReadLines(path: Path) -> list[str]:
 def WriteLines(path: Path, lines: list[str]) -> None:
     with open(path, "w", encoding="utf-8", newline="") as file:
         file.writelines(lines)
+
+
+def TaskListStart(lines: list[str]) -> int:
+    """Index of the first task line; everything before it (header comment, title) is the file's header."""
+    return next((index for index, line in enumerate(lines) if TASK_PATTERN.match(line.rstrip("\r\n"))), len(lines))
+
+
+def ReplaceTaskList(path: Path, taskLines: list[str]) -> None:
+    """Keep the file's header and replace everything from its first task line on with taskLines (no line endings).
+
+    How a Notion task list is cached in TASKS.md (core/tasksource.py). The file is created when missing and left
+    untouched when it already holds exactly these lines.
+    """
+    lines = ReadLines(path) if path.is_file() else []
+    newline = next((LineEnding(line) for line in lines if LineEnding(line)), "\n")
+    header = lines[:TaskListStart(lines)] if path.is_file() else list(NEW_FILE_HEADER)
+    if header and not LineEnding(header[-1]):  # the header may end the file unterminated
+        header[-1] += newline
+    updated = header + [line + newline for line in taskLines]
+    if updated != lines:
+        WriteLines(path, updated)
 
 
 # ---------- parsing ----------
@@ -96,7 +136,7 @@ def UnreadTaskLines(path: Path) -> list[str]:
         inTask = False
         if not commented and NEAR_TASK_PATTERN.match(text):
             warnings.append(
-                f"{path.name} line {lineNo} is not read as a task (expected: - [ ] [doc|code|sys] <title>): {text.strip()}"
+                f"{path.name} line {lineNo} is not read as a task (expected: - [ ] [{KINDS}] <title>): {text.strip()}"
             )
     return warnings
 
@@ -126,6 +166,67 @@ def AddDetail(task: Task, text: str) -> None:
         task.resultRef, task.resultRun = (withRun["ref"], withRun["run"]) if withRun else (value, "")
 
 
+# ---------- follow-up tasks ----------
+
+def SplitFollowUps(text: str, origin: str = "") -> tuple[str, list[FollowUp], list[str]]:
+    """(the message without its follow-up block, the follow-up tasks listed in it, the lines not read as one).
+
+    The block runs from FOLLOWUP_MARKER to the next "=== ... ===" section or the end of the message, so an agent
+    may put it anywhere after its output - before or after the notes and review-response sections, which are
+    split off the returned text afterwards.
+    """
+    lines = text.splitlines(keepends=True)
+    start = next((index for index, line in enumerate(lines) if line.strip() == FOLLOWUP_MARKER), None)
+    if start is None:
+        return text, [], []
+    end = next((index for index in range(start + 1, len(lines)) if SECTION_MARKER.match(lines[index])), len(lines))
+    items, unread = ParseFollowUps("".join(lines[start + 1:end]), origin)
+    return "".join(lines[:start] + lines[end:]), items, unread
+
+
+def ParseFollowUps(block: str, origin: str = "") -> tuple[list[FollowUp], list[str]]:
+    """(the follow-up tasks of a block, the list items in it that are not readable as one).
+
+    A task line follows the task list's own syntax ("- [code] title" plus indented detail lines); prose and
+    empty lines are left out, while a list item that was meant as a task but cannot be read is reported.
+    """
+    items: list[FollowUp] = []
+    unread: list[str] = []
+    current: FollowUp | None = None
+    for line in block.splitlines():
+        text = line.rstrip()
+        detail = DETAIL_PATTERN.match(text)
+        if current and detail:  # same rule as ParseTasks: an indented line configures the task above it
+            current.details.append(detail["text"])
+            continue
+        match = FOLLOWUP_PATTERN.match(text.strip())
+        current = FollowUp(match["kind"].lower(), match["role"], match["title"], origin=origin) if match else None
+        if current:
+            items.append(current)
+        elif UNREAD_FOLLOWUP_PATTERN.match(text.strip()):
+            unread.append(text.strip())
+    return items, unread
+
+
+def AppendTask(path: Path, followUp: FollowUp) -> str:
+    """Add a follow-up task as a new pending task at the end of the file, detail lines and all.
+
+    Appending keeps the existing task IDs stable, which is what "after:" and "ref: Txx" rely on - the same rule
+    the file's header asks of the user.
+    """
+    if not path.is_file():
+        raise TaskFileError(f"Task file not found: {path}")
+    lines = ReadLines(path)
+    newline = next((LineEnding(line) for line in lines if LineEnding(line)), "\n")
+    if lines and not LineEnding(lines[-1]):  # the file may end unterminated
+        lines[-1] += newline
+    role = f":{followUp.role}" if followUp.role else ""
+    added = [f"- [{STATUS_PENDING}] [{followUp.kind}{role}] {followUp.title}{newline}"]
+    added += [f"  {detail}{newline}" for detail in followUp.details]
+    WriteLines(path, lines + added)
+    return f"{path.name} line {len(lines) + 1}"
+
+
 # ---------- dependencies ----------
 
 def LinkDependencies(tasks: list[Task]) -> list[str]:
@@ -141,6 +242,8 @@ def LinkDependencies(tasks: list[Task]) -> list[str]:
             errors.append(f"{task.id} after: a task cannot wait for itself")
         if task.status == STATUS_PENDING and task.mode not in (MODE_STANDARD, MODE_FULL):
             errors.append(f"{task.id} mode: unknown mode '{task.mode}' (use: {MODE_FULL})")
+        if task.status == STATUS_PENDING and task.full and task.kind in SINGLE_PART_KINDS:
+            errors.append(f"{task.id} mode: {MODE_FULL} is not available for {task.kind} tasks (they run as one agent)")
     cycle = FindCycle(tasks)
     if cycle:
         errors.append(f"dependency cycle: {' -> '.join(cycle)}")

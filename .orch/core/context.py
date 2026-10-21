@@ -61,7 +61,8 @@ def RefTasks(task: Task) -> list[Task]:
 
 
 def ResultFiles(task: Task, projectDir: Path) -> list[Path]:
-    """Files a task's result points at: its document, or the system files a sys task applied."""
+    """Files a task's result points at: its document (doc) or progress report (other kinds); a sys task's result
+    names the system files it applied until its report is written, and older result lines still do."""
     names = task.resultRef.removeprefix(SYS_APPLIED_PREFIX).split(", ") if task.resultRef.startswith(SYS_APPLIED_PREFIX) else [task.resultRef]
     paths = [projectDir / name for name in names if name]
     return [path.resolve() for path in paths if path.is_file()]
@@ -78,12 +79,21 @@ def NewestChange(task: Task, projectDir: Path) -> float | None:
     return max(times) if times else None
 
 
+def WrittenAtRunEnd(up: Task, task: Task) -> bool:
+    """An upstream result written when the run that built the task ended (a progress report, or the files a sys task
+    applied): newer than everything that run built on it, without having changed since."""
+    return up.kind != "doc" and bool(up.resultRun) and up.resultRun == task.resultRun
+
+
 def StaleNotices(tasks: list[Task], projectDir: Path) -> list[str]:
     """Done tasks whose upstream result changed after they were made: they were built on an older version."""
     notices = []
     for task in (task for task in tasks if task.status == STATUS_DONE):
         builtAt = NewestChange(task, projectDir)
-        newer = [up.id for up in task.upstream if builtAt and (NewestChange(up, projectDir) or 0) > builtAt]
+        newer = [
+            up.id for up in task.upstream
+            if builtAt and not WrittenAtRunEnd(up, task) and (NewestChange(up, projectDir) or 0) > builtAt
+        ]
         if newer:
             notices.append(f"{task.id} was built on an older result of {', '.join(newer)}; set it back to [ ] to rebuild it")
     return notices

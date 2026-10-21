@@ -13,7 +13,7 @@ You split one task into parts for agents that work in parallel. No human is watc
 - **Transforming an existing document** (translation, summarizing, rewriting): split by contiguous ranges of the source and name the exact headings or ranges each part covers.
 - **Generating options or ideas**: split by distinct angles so that the parts do not produce duplicates.
 - **Code tasks**: split only along disjoint files or modules, and list the files each part owns. If two parts would need to edit the same file, use 1 part.
-- **Sys tasks** (changes to the orchestrator itself: `.orch/`, `.claude/`, `CLAUDE.md`, `TASKS.md`, `orch.bat`, `orch-reset.bat`): same rule as code tasks. Overlapping parts cannot be combined, and most sys changes are coupled, so prefer 1 part.
+- **Sys tasks** (changes to the orchestrator itself: `.orch/`, `.claude/`, `CLAUDE.md`, `README.md`, `TASKS.md`, `orch.bat`, `orch-reset.bat`): same rule as code tasks. Overlapping parts cannot be combined, and most sys changes are coupled, so prefer 1 part.
 
 ## Each Part
 - `title`: a few words.

@@ -9,9 +9,16 @@ each other, every revision is re-checked, and the merged result is reviewed agai
 
   - [ ] [doc] <title>           research / writing / analysis -> Markdown deliverable
   - [ ] [code] <title>          code change in an isolated git worktree (the project must be a git repo)
-  - [ ] [sys] <title>           change this orchestrator itself (.orch/, .claude/, CLAUDE.md, TASKS.md, orch.toml, orch*.bat)
+  - [ ] [sys] <title>           change this orchestrator itself (.orch/, .claude/, CLAUDE.md, README.md, TASKS.md, orch.toml, orch*.bat)
                                 in a sandbox copy; applied automatically when the run ends, only if the
                                 automated checks (compile, import, preview, JSON) and reviews pass
+  - [ ] [test] <title>          try something out in a disposable copy of the whole project (files may be
+                                changed and commands run there); the copy is deleted when the run ends and
+                                only the progress report remains - the project is never touched
+  - [ ] [task] <title>          write new tasks: the agent's result is a list of tasks in this file's syntax,
+                                reviewed like any result and added here as pending tasks when the run ends
+                                (up to 20; a later run executes them). They are numbered from the next free ID,
+                                which the agent is told, so "after:" between them names those IDs
   - [ ] [<kind>:<role>] <title> also injects .claude/skills/develop/<role>.md when that file exists
                                 (role skills are not shipped; add your own, e.g. develop/refactorer.md)
 
@@ -32,12 +39,32 @@ Indent lines under a task (2+ spaces) to add detailed instructions. These detail
                       Preview shows a notice when a done task was built on an older result than the current one.
   lang: en            output language of a doc deliverable (default: Korean)
   verify: <command>   shell command that must pass for code/sys tasks (e.g. pytest -q)
-  mode: full          multi-agent pipeline for large tasks (default: one agent + one review)
+  mode: full          multi-agent pipeline for large tasks (default: one agent + one review); not for test or task
   → result: <location> (run <id>)  written by the orchestrator as the last line under a task when it
-                      succeeds; "after:" and "ref: Txx" read it (leave it as is, or delete it before a re-run)
+                      succeeds: a doc task's document, or the progress report for every other kind;
+                      "after:" and "ref: Txx" read it (leave it as is, or delete it before a re-run)
 
 Status: [ ] pending, [~] running, [x] done, [!] failed. Set a task back to [ ] to retry it.
 A task whose "after:" task did not succeed stays [ ] (blocked) and runs again next time.
+
+A task that succeeds may also add tasks here itself: when its agents found work that needs a task of its own
+(outside the task's scope, waiting on a decision, a problem they must not fix there), the orchestrator appends
+it as a new pending task at the end of the list, with the detail lines the agent asked for - up to 5 per task.
+Each proposal is reviewed with the task's result, and a detail line that would stop the next run (an unknown
+"after:" task, a "ref:" that matches nothing) is dropped. The run log and the progress report say what was
+added; review the new lines like your own and delete what you do not want. Failed tasks add nothing (they run
+again), and a title already in the list is not added twice. Set follow_ups = false under [tasks] in orch.toml
+to turn this off: agents are then not asked for follow-ups and nothing is written here.
+
+The task list can also live in a Notion database instead of this file: set source = "notion" under [tasks]
+in orch.toml and the database link under [notion]. One row is then one task, with the properties task (the ID,
+T01), title, kind (doc|code|sys|test|task), status (pending|running|done|failed), ref (one "ref:" per line), details (the
+other detail lines above, one per line) and result (written by the orchestrator) - the names are lower case and
+case-sensitive; see orch.toml for the setup.
+This file becomes the database's cache: every run and preview rewrites the task list below from the rows (this
+header stays), the run works on it as usual, and status, results and follow-up tasks are written to the row and
+to this file alike. Edit the tasks in Notion; edits here are overwritten. "orch --source file" runs this file as
+it is, without Notion (its IDs then follow line order again).
 
 Run:      orch            (PowerShell: .\orch)    or /orch in Claude Code
 Preview:  orch preview    (PowerShell: .\orch preview)
@@ -46,7 +73,11 @@ Reset:    orch-reset      (PowerShell: .\orch-reset)  permanently deletes doc/*.
 Results:  docs -> doc/[Txx]_<YYMMDD>_<Korean title>.md (one document per task, content only)
           code -> staged, uncommitted changes per task (review with git diff --cached)
           sys  -> applied to the system files; originals in .orch/runs/<run-id>/<Txx>/backup/
-          progress report -> report/[Txx]_<YYMMDD>_<title>.md for every code and doc task that ran (Korean:
-                  timeline, assumptions, review findings and how they were handled, follow-ups)
+          test -> the progress report only
+          task -> new pending tasks at the end of this list (the progress report names their IDs)
+          progress report -> report/[Txx]_<YYMMDD>_<title>.md for every task that ran, sys included (Korean:
+                  timeline, assumptions, review findings and how they were handled, follow-ups); for every
+                  kind but doc it is the task's result: the result line points at it
           logs, reviews, summary -> .orch/runs/<run-id>/
 -->
+

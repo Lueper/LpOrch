@@ -4,14 +4,45 @@
 [run]
 max_parallel = 0            # concurrent agents across all tasks; 0 = automatic (CPU, memory, task count)
 max_rounds = 1              # review/fix rounds per task; 0 = no review
-budget_per_agent = 2.0      # USD cap per agent call
-max_turns = 40              # turn cap per agent call
+budget_per_agent = 20.0      # USD cap per agent call
+max_turns = 100              # turn cap per agent call
 
 [agent]
 provider = "claude"         # every role without its own provider below: claude | gemini
 
+# Tasks in a Notion database (source = "notion"). One row = one task. The property names are fixed in
+# .orch/core/notion.py, so the database must have exactly these (names are case-sensitive):
+#   task     title      task ID: T01, T02, ... - what "after: T01" and "ref: T01" point at
+#   title    text       the task title
+#   kind     select     doc | code | sys | test | task (also "code:refactorer" for a role skill)
+#   status   status     with the options pending | running | done | failed  ->  [ ] [~] [x] [!]
+#   ref      text       base materials, one per line (path, glob, URL or task ID) - the "ref:" lines
+#   details  text       the other detail lines, one per line: "after: T01", "lang: en", "verify: ...",
+#                       "mode: full", instructions - exactly the lines you would indent under a task
+#   result   text       written by the orchestrator: "doc/x.md (run 20261008-101500)"
+# TASKS.md is then the cache: every run and preview rewrites its task list from the rows (the header stays),
+# the run works on the file as usual, and status, results and follow-up tasks go to the row and the file alike.
+# Edit tasks in Notion - edits to the cached lines are overwritten by the next run.
+# Setup: create an internal integration (notion.so/my-integrations), invite it to the database
+# (Share -> Connections), put its secret in the NOTION_TOKEN environment variable - never in this file -
+# and check with "orch preview" before the first run.
+# [notion]
+# database = ""             # the database link ("Copy link") or its 32-character id; the "?v=" view id is ignored
+# token_env = "NOTION_TOKEN"  # environment variable holding the integration token
+
+[tasks]
+# source = "file"             # where the task list lives: "file" = TASKS.md, "notion" = the database below
+source = "notion"             # where the task list lives: "file" = TASKS.md, "notion" = the database below
+follow_ups = true           # a succeeded task may add the follow-up tasks its agents asked for to the task list
+                            # (new pending tasks at the end, at most 5 per task)
+                            # false = agents are not asked for them and nothing is written to the list
+
+[notion]
+database = "https://app.notion.com/p/3f39a5ea322980579eaed7aa90c48205"             # the database link ("Copy link") or its 32-character id; the "?v=" view id is ignored
+token_env = "NOTION_TOKEN"  # environment variable holding the integration token
+
 [claude]
-model = "opus"                  # main model, alias or ID (e.g. "opus", "sonnet"); "" = the CLI's default
+model = "claude-opus-5-5"   # main model, alias or ID (e.g. "opus", "sonnet"); "" = the CLI's default
 small_model = "haiku"       # namer and reporter: one-shot chores; "" = same as model
 cli_path = ""               # native claude executable; "" = auto-detect (npm installs included)
 # max_retries = 10          # retries of a failed API request (429, 529, network); unset = the CLI's default (10)
@@ -22,8 +53,8 @@ small_model = "flash-lite"  # namer and reporter; "" = same as model
 cli_path = ""               # gemini executable or gemini.js; "" = auto-detect (npm installs included)
 max_retries = 0             # retries of a failed API request (429 quota, network), 0-9; 0 = fail at once
 
-# Per-role overrides of provider and/or model. Roles: doc-worker, code-worker, sys-worker, reviewer,
-# doc-merger, code-merger, planner, namer, reporter
+# Per-role overrides of provider and/or model. Roles: doc-worker, code-worker, sys-worker, test-worker,
+# task-worker, reviewer, doc-merger, code-merger, planner, namer, reporter
 # [roles.reviewer]
 # provider = "gemini"
 # model = "pro"

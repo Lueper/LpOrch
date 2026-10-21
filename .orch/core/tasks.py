@@ -1,11 +1,13 @@
 """The Task/Part model: task settings, runtime state, and the review rules that decide revisions.
 
-A Task is one line of TASKS.md (parsed by taskfile.py); the planner splits it into Parts, one per parallel agent.
+A Task is one line of TASKS.md (taskfile.py) - copied there from a row of a Notion database first when the task list
+lives in Notion (notion.py, tasksource.py); the planner splits it into Parts, one per parallel agent.
 Kept free of claude_agent_sdk imports so `preview` works without the SDK installed.
 """
 from __future__ import annotations
 
 import asyncio
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -13,28 +15,64 @@ STATUS_PENDING = " "
 STATUS_RUNNING = "~"
 STATUS_DONE = "x"
 STATUS_FAILED = "!"
+# doc: a document in doc/; code: staged changes; sys: the orchestrator's own files; test: a run in a disposable copy
+# of the project that leaves only its report; task: new tasks written to the task list
+TASK_KINDS = ("doc", "code", "sys", "test", "task")
+SINGLE_PART_KINDS = ("test", "task")  # no "mode: full": a test or a task list is one agent's single result
 # standard: one agent, one fresh review, revision, verify only after CRITICAL findings
 # full: planner splits into 1..MAX_PARTS parallel parts, ring review, every revision verified, merge + integration review
 MODE_STANDARD = "standard"
 MODE_FULL = "full"
 MAX_PARTS = 4  # parallel agents per "mode: full" task; the planner picks 1..MAX_PARTS
+MAX_FOLLOWUPS = 5  # follow-up tasks one task may add to the task list; more means the agent is planning, not noting
+MAX_WRITTEN_TASKS = 20  # tasks one [task] task may write: planning is its job
 DEFAULT_DOC_LANG = "Korean"  # doc deliverables; "lang:" overrides per task
 LANG_NAMES = {"ko": "Korean", "kr": "Korean", "en": "English", "ja": "Japanese"}
-SYS_APPLIED_PREFIX = "applied to the project: "  # a sys task's result: the files it changed
+SYS_APPLIED_PREFIX = "applied to the project: "  # a sys task's changed files: its result until its report replaces it
 
 
 class TaskFileError(Exception):
-    """TASKS.md is missing or a task line can no longer be located."""
+    """The task list cannot be read, or a task's line or database row can no longer be located."""
+
+
+def TaskId(number: int) -> str:
+    """T01, T02, ... - task IDs as the task list numbers them."""
+    return f"T{number:02d}"
+
+
+def TitleKey(kind: str, title: str) -> tuple[str, str]:
+    """A task's identity by kind and title, spacing and case ignored: how a follow-up is recognized as a duplicate."""
+    return kind, re.sub(r"\s+", " ", title).strip().lower()
+
+
+@dataclass
+class FollowUp:
+    """A follow-up task an agent asked for while working on a task.
+
+    Written as a task line in the agent's final message (pipeline/phases.py, parsed by core/taskfile.py) and
+    appended to the task list as a new pending task once the run's results are in (orchestrate.AddFollowUpTasks).
+    """
+
+    kind: str  # one of TASK_KINDS, like a task's
+    role: str | None  # optional role skill, as in "[code:refactorer]"
+    title: str
+    details: list[str] = field(default_factory=list)  # detail lines as written: "ref: ...", "verify: ...", ...
+    origin: str = ""  # the part or task whose agent proposed it
+
+    @property
+    def key(self) -> tuple[str, str]:
+        return TitleKey(self.kind, self.title)
 
 
 @dataclass(eq=False)  # identity equality: Task and Part reference each other
 class Task:
     id: str
-    kind: str  # "doc" | "code" | "sys"
+    kind: str  # one of TASK_KINDS
     role: str | None  # optional .claude/skills/develop/<role>.md
     title: str
-    lineNo: int
+    lineNo: int  # line in TASKS.md (for a Notion row: its line in the TASKS.md cache)
     status: str = STATUS_PENDING
+    sourceId: str = ""  # Notion page id of the row this task came from; empty for a TASKS.md line
     details: list[str] = field(default_factory=list)
     after: list[str] = field(default_factory=list)  # "after:" IDs of tasks this one builds on
     refs: list[str] = field(default_factory=list)  # "ref:" base materials as written: files, folders, globs, URLs
@@ -54,6 +92,8 @@ class Task:
     planNote: str = ""
     reviews: list[dict] = field(default_factory=list)  # reviews of the integrated multi-part result
     responses: list[str] = field(default_factory=list)  # fixer's answers to those reviews
+    followUps: list[FollowUp] = field(default_factory=list)  # follow-up tasks the merger or integration fixer asked for
+    writtenTasks: list[FollowUp] = field(default_factory=list)  # task: its result, added to the task list at the end
     revisions: int = 0
     checkOk: bool | None = None  # automated checks on the integrated result; None = not run
     checkOutput: str = ""
@@ -101,13 +141,16 @@ class Part:
     brief: str
     # Runtime state filled in by the pipeline
     workCwd: Path | None = None
-    worktree: Path | None = None  # code: git worktree; sys: sandbox copy
+    worktree: Path | None = None  # code: git worktree; sys: sandbox copy; test: disposable copy of the project
+    copyStamps: dict[str, tuple[int, int]] = field(default_factory=dict)  # test: the copy's files as made (size, mtime)
     branch: str | None = None
     sessionId: str | None = None
+    contextTokens: int = 0  # peak context of that worker session; 0 = not reported (the fix then resumes it)
     costUsd: float = 0.0
     error: str | None = None
     reviews: list[dict] = field(default_factory=list)
     responses: list[str] = field(default_factory=list)  # worker's answers to each review it addressed
+    followUps: list[FollowUp] = field(default_factory=list)  # follow-up tasks this part's worker asked for
     revisions: int = 0
     checkOk: bool | None = None  # automated checks (code/sys); None = not run
     checkOutput: str = ""
@@ -121,6 +164,18 @@ class Part:
     @property
     def ok(self) -> bool:
         return self.error is None
+
+
+def FollowUpsOf(task: Task) -> list[FollowUp]:
+    """Every follow-up task asked for while working on the task, in the order proposed, duplicates dropped.
+
+    A part proposes the same follow-up again in a revision (the worker keeps its session), and parts of one task
+    often see the same gap, so only the first of each kind-and-title survives.
+    """
+    unique: dict[tuple[str, str], FollowUp] = {}
+    for item in [*(entry for part in task.parts for entry in part.followUps), *task.followUps]:
+        unique.setdefault(item.key, item)
+    return list(unique.values())
 
 
 def HasCritical(review: dict) -> bool:

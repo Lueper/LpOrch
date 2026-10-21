@@ -10,6 +10,7 @@ AgentResult.
 - structured output: spec.schema asked for in the prompt, parsed from the reply, asked again once when it is not
   valid JSON
 - resume: --resume <session id> from the session's own folder; fork: a copy of the saved session (--session-file)
+- transient errors: TRANSIENT_ERROR - network failures and 5xx; runner retries the call. Quota errors fail fast
 The CLI reports tokens, not money: calls count as $0 and their token use goes to run.log. budget_per_agent does not
 apply to Gemini calls; max_turns does.
 """
@@ -51,6 +52,12 @@ EXTRA_PROGRESS_KEYS = ("dir_path", "prompt")  # Gemini parameter names worth ech
 # Failed API attempts and quota details on stderr: shown on the console, or a rate-limited agent looks stalled
 API_FAILURE = re.compile(r"^(?:Attempt \d+ failed\b|\* Quota exceeded for metric:)")
 MAX_NOTICE_CHARS = 200
+# Errors worth another attempt (runner.RunAgent): the network or the API broke off. Quota errors (429,
+# RESOURCE_EXHAUSTED) are left out: they fail fast on purpose ([gemini] max_retries)
+TRANSIENT_ERROR = re.compile(
+    r"(?i:fetch failed|ECONNRESET|ETIMEDOUT|EAI_AGAIN|socket hang up|overloaded)|\b50[0234]\b|UNAVAILABLE|INTERNAL"
+    r"|DEADLINE_EXCEEDED"
+)
 ROLE_INTRO = "Instructions for your role from the orchestrator that runs you (treat them as your system instructions):"
 TASK_INTRO = "=== YOUR TASK ==="
 JSON_REQUEST = (

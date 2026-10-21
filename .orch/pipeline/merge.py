@@ -1,5 +1,6 @@
 """Merge one task's parts into its own result, review the integrated result, and deliver it:
-doc/[Txx]_<YYMMDD>_<title>.md, staged code changes, or system files applied when the run ends.
+doc/[Txx]_<YYMMDD>_<title>.md, staged code changes, system files applied when the run ends, a test's report only,
+or the tasks a [task] task wrote, added to the task list when the run ends.
 """
 from __future__ import annotations
 
@@ -9,8 +10,12 @@ from pathlib import Path
 from agents.runner import AgentSpec, LoadPrompt, RunAgent, WriteText
 from core.paths import DocPath, SanitizeTitle
 from core.runcontext import RunContext
-from core.tasks import SYS_APPLIED_PREFIX, Part, Task
-from pipeline.phases import ArchiveAndWrite, Clip, GitCall, RevisionRequest, RunChecks, SplitNotes, SplitResponse, WorkerSystemPrompt
+from core.taskfile import ParseFollowUps
+from core.tasks import MAX_WRITTEN_TASKS, SYS_APPLIED_PREFIX, Part, Task
+from pipeline.phases import (
+    FOLLOWUP_DELIVERY, MAX_UNREAD_SHOWN, ArchiveAndWrite, Clip, FollowUpText, GitCall, RevisionRequest, RunChecks,
+    SplitNotes, SplitResponse, TakeFollowUps, WorkerSystemPrompt,
+)
 from pipeline.review import IntegrationLoop
 from reporting.report import BlockingIssues, OpenIssues, ReviewState
 from workspace import gitops, sandbox
@@ -20,7 +25,9 @@ NAMER_INPUT_CHARS = 3000  # the head of the document is enough to name it
 
 
 async def MergeTask(task: Task, ctx: RunContext, maxRounds: int) -> None:
-    merge = {"doc": MergeDocTask, "code": MergeCodeTask, "sys": MergeSysTask}[task.kind]
+    merge = {
+        "doc": MergeDocTask, "code": MergeCodeTask, "sys": MergeSysTask, "test": MergeTestTask, "task": MergeTaskList,
+    }[task.kind]
     await merge(task, ctx, maxRounds)
 
 
@@ -52,14 +59,16 @@ async def DocContent(task: Task, ctx: RunContext) -> tuple[str, str, str | None]
     if len(task.parts) == 1:
         return (ctx.TaskDir(task.parts[0].id) / "output.md").read_text(encoding="utf-8"), "1 part", None
     spec = AgentSpec(role="doc-merger", cwd=ctx.runDir, systemAppend=LoadPrompt("merger"))
+    delivery = f"\n\n{FOLLOWUP_DELIVERY}" if ctx.config.followUps else ""  # a gap no part covers can become a task
     prompt = (
         f"Assemble the parts of task {task.id} ({task.title}) into one document. "
         "Parts are listed in the planned order.\n\n" + "\n\n".join(PartBlock(part, ctx) for part in task.parts)
+        + delivery
     )
     result = await RunAgent(f"{task.id} merge", prompt, spec, ctx)
     task.costUsd += result.costUsd
     if result.ok:
-        document, notes = SplitNotes(result.text)
+        document, notes = SplitNotes(TakeFollowUps(task, result.text, ctx))
         if notes:  # how the merger resolved conflicts between parts: for the progress report
             WriteText(ctx.TaskDir(task.id) / "notes.md", notes)
         return document, f"merged {len(task.parts)} parts", result.sessionId
@@ -81,8 +90,8 @@ async def ReviewMergedDoc(task: Task, ctx: RunContext, maxRounds: int, content: 
     WriteText(merged, content)
     state = {"session": session, "rounds": 0}
 
-    async def Snapshot() -> str:
-        return Clip(merged)
+    async def Snapshot() -> str:  # with the merger's own follow-up proposals: they are reviewed like the document
+        return "\n\n".join(item for item in (Clip(merged), FollowUpText(task)) if item)
 
     async def Fix(review: dict) -> bool:
         spec = AgentSpec(role="doc-merger", cwd=ctx.runDir, systemAppend=LoadPrompt("merger"), resume=state["session"])
@@ -92,7 +101,7 @@ async def ReviewMergedDoc(task: Task, ctx: RunContext, maxRounds: int, content: 
         if not result.ok:
             task.notes.append(f"merge fix failed: {result.error}")
             return False
-        output, response = SplitResponse(result.text)
+        output, response = SplitResponse(TakeFollowUps(task, result.text, ctx, replace=True))
         output, notes = SplitNotes(output)
         state["session"], state["rounds"] = result.sessionId or state["session"], state["rounds"] + 1
         task.responses.append(response)
@@ -121,6 +130,39 @@ async def KoreanTitle(task: Task, content: str, ctx: RunContext) -> str:
     return SanitizeTitle(str(data.get("title", ""))) or SanitizeTitle(task.title) or ctx.runId
 
 
+# ---------- test and task (one part each: SINGLE_PART_KINDS) ----------
+
+async def MergeTestTask(task: Task, ctx: RunContext, maxRounds: int) -> None:
+    """A test leaves only its report: its copy of the project goes with the run's other workspaces."""
+    part = task.parts[0]
+    part.merged = True
+    # Until the progress report exists (orchestrate.RunPipeline points here at it), a later task of this run that
+    # builds on the test with "ref: Txx" reads the worker's own report
+    task.resultRef = (ctx.TaskDir(part.id) / "notes.md").relative_to(ctx.projectDir).as_posix()
+    task.result = "report only (the test's copy of the project is deleted when the run ends)"
+    Blocked(task, "test unresolved")
+
+
+async def MergeTaskList(task: Task, ctx: RunContext, maxRounds: int) -> None:
+    """Read the tasks a [task] worker wrote; orchestrate.AddNewTasks adds them to the task list when the run ends."""
+    part = task.parts[0]
+    part.merged = True
+    items, unread = ParseFollowUps((ctx.TaskDir(part.id) / "output.md").read_text(encoding="utf-8"), task.id)
+    if unread:  # a line meant as a task that cannot be read is worth seeing in summary.md and the report
+        more = f" (+{len(unread) - MAX_UNREAD_SHOWN} more)" if len(unread) > MAX_UNREAD_SHOWN else ""
+        task.notes.append(f"line(s) not read as a task: {'; '.join(unread[:MAX_UNREAD_SHOWN])}{more}")
+    if len(items) > MAX_WRITTEN_TASKS:
+        task.notes.append(f"{len(items)} tasks written; only the first {MAX_WRITTEN_TASKS} are added")
+        items = items[:MAX_WRITTEN_TASKS]
+    if not items:
+        task.error = "no task line in the result (expected: - [kind] <title>)"
+        return
+    if Blocked(task, "tasks not added"):
+        return
+    task.writtenTasks = items
+    task.result = f"{len(items)} task(s) to add to the task list when the run ends"
+
+
 # ---------- workspaces (code and sys) ----------
 
 async def ReviewWorkspace(task: Task, ctx: RunContext, maxRounds: int, workdir: Path, diff) -> None:
@@ -129,8 +171,8 @@ async def ReviewWorkspace(task: Task, ctx: RunContext, maxRounds: int, workdir: 
     if maxRounds == 0:
         return
 
-    async def Snapshot() -> str:
-        return f"Diff against base:\n{await diff()}"
+    async def Snapshot() -> str:  # with the integration fixer's follow-up proposals, so those are reviewed too
+        return "\n\n".join(item for item in (f"Diff against base:\n{await diff()}", FollowUpText(task)) if item)
 
     async def Fix(review: dict) -> bool:
         spec = AgentSpec(role=f"{task.kind}-worker", cwd=workdir, systemAppend=WorkerSystemPrompt(task), addDirs=task.refDirs)
@@ -144,7 +186,7 @@ async def ReviewWorkspace(task: Task, ctx: RunContext, maxRounds: int, workdir: 
             if checkpoint:
                 await asyncio.to_thread(sandbox.Restore, workdir, checkpoint)
             return False
-        task.responses.append(SplitResponse(result.text)[1])
+        task.responses.append(SplitResponse(TakeFollowUps(task, result.text, ctx, replace=True))[1])
         if task.kind == "code":
             await GitCall(ctx, gitops.CommitAll, workdir, f"orch({task.id}): address integration review")
         await RunChecks(task, task, workdir, ctx)
@@ -291,6 +333,7 @@ def ApplySystemTask(task: Task, ctx: RunContext) -> None:
         sandbox.SaveChangedFiles(task.workspace, changed, taskDir / "changes")
         task.error = f"not applied: changed meanwhile in the project ({', '.join(conflicts)}); new versions kept in {taskDir / 'changes'}"
         return
-    task.resultRef = SYS_APPLIED_PREFIX + ", ".join(applied)  # "ref: Txx" reads the files back from this
+    # The report's "Result location"; the report then becomes the result (orchestrate.RunPipeline), unless it fails
+    task.resultRef = SYS_APPLIED_PREFIX + ", ".join(applied)
     task.result = f"applied {len(applied)} file(s): {', '.join(applied)}; originals backed up in {taskDir / 'backup'}"
     ctx.log.info("[%s] applied to the project: %s", task.id, ", ".join(applied))
