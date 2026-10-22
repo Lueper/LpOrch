@@ -64,7 +64,8 @@ class TokenUsage:
     """What one agent call read and wrote, as far as the backend reports it (claude.py reports all of it).
 
     A session re-reads its whole context on every request, so peakContext - the largest single request - and
-    cacheReadTokens are what make a long session expensive; run.log shows them next to the cost.
+    cacheReadTokens are what make a long session expensive; run.log shows them next to the cost, with the call's
+    wall-clock and API time and the models that served it.
     """
 
     turns: int = 0
@@ -73,6 +74,9 @@ class TokenUsage:
     cacheWriteTokens: int = 0
     outputTokens: int = 0
     peakContext: int = 0  # tokens in the largest request: the session's context at its longest; 0 = not reported
+    durationMs: int = 0  # wall-clock time of the call; 0 = not reported
+    apiDurationMs: int = 0  # time spent waiting on the API; 0 = not reported
+    models: list[str] = field(default_factory=list)  # model IDs that served the call (subagents included)
 
     def Add(self, other: TokenUsage | None) -> TokenUsage:
         """Both calls together, as RunAgent counts a retry; the peak is the larger of the two."""
@@ -81,11 +85,13 @@ class TokenUsage:
         return TokenUsage(
             self.turns + other.turns, self.inputTokens + other.inputTokens, self.cacheReadTokens + other.cacheReadTokens,
             self.cacheWriteTokens + other.cacheWriteTokens, self.outputTokens + other.outputTokens,
-            max(self.peakContext, other.peakContext),
+            max(self.peakContext, other.peakContext), self.durationMs + other.durationMs,
+            self.apiDurationMs + other.apiDurationMs, list(dict.fromkeys([*self.models, *other.models])),
         )
 
     def Summary(self) -> str:
-        """"40 turns, peak context 103k, cache read 2.0M, cache write 103k, input 1k, output 40k" for run.log."""
+        """"40 turns, peak context 103k, cache read 2.0M, cache write 103k, input 1k, output 40k, time 6m12s,
+        API 5m40s, model claude-opus-5-5" for run.log."""
         parts = [f"{self.turns} turns"] if self.turns else []
         if self.peakContext:
             parts.append(f"peak context {TokenCount(self.peakContext)}")
@@ -93,11 +99,26 @@ class TokenUsage:
             f"cache read {TokenCount(self.cacheReadTokens)}", f"cache write {TokenCount(self.cacheWriteTokens)}",
             f"input {TokenCount(self.inputTokens)}", f"output {TokenCount(self.outputTokens)}",
         ]
+        if self.durationMs:
+            parts.append(f"time {Duration(self.durationMs)}")
+        if self.apiDurationMs:
+            parts.append(f"API {Duration(self.apiDurationMs)}")
+        if self.models:
+            parts.append(f"model {'+'.join(self.models)}")
         return ", ".join(parts)
 
 
 def TokenCount(count: int) -> str:
     return f"{count / 1_000_000:.1f}M" if count >= 1_000_000 else f"{round(count / 1000)}k"
+
+
+def Duration(milliseconds: int) -> str:
+    """"6m12s", or "42.3s" under a minute."""
+    seconds = milliseconds / 1000
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes, rest = divmod(round(seconds), 60)
+    return f"{minutes}m{rest:02d}s"
 
 
 @dataclass

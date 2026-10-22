@@ -79,6 +79,20 @@ python3 -m venv .venv
 
    Claude Code 안에서는 `/orch`, `/orch preview`로도 실행 가능함 (OS에 맞는 런처를 호출함). macOS에서 `permission denied`가 나오면 실행 권한이 없는 것임 → `chmod +x orch.sh orch-reset.sh` 또는 `sh orch.sh`로 실행
 
+   주기 실행 — 숫자(분)를 주면 Ctrl+C로 멈출 때까지 그 간격으로 반복함. 다른 옵션도 그대로 붙일 수 있음 (`orch 60 --max-rounds 2`)
+
+   ```
+   orch 60               # Windows (PowerShell: .\orch 60) - 60분마다 run
+   ./orch.sh 60          # macOS/Linux
+   ```
+
+   - 간격은 run **시작** 기준. run이 간격보다 오래 걸리면 끝나자마자 다음 run 시작 (겹쳐 돌지 않음)
+   - 매 run은 새 프로세스로 실행됨 → 작업 목록·`orch.toml`·`[sys]` 작업이 바꾼 코드가 다음 run에 반영됨
+   - pending 작업이 없거나 전부 `after:` 선행 실패로 blocked면 run을 만들지 않고 다음 주기까지 대기함
+   - 설정·작업 목록 오류(`error: ...`)가 나도 멈추지 않고 다음 주기에 다시 확인함 (시작 시점의 `orch.toml` 오류만 즉시 종료)
+   - run 도중 Ctrl+C → 해당 run이 작업을 pending으로 되돌린 뒤 종료됨
+   - 후속 작업(follow-up)·`[task]` 작업이 추가한 Task도 다음 주기에 실행됨 → 연쇄 실행 비용이 걱정되면 `[tasks] follow_ups = false`
+
 4. 결과 확인 — `doc/[Txx]_<날짜>_<제목>.md`, `git diff --cached`(code), `report/[Txx]_<날짜>_<제목>.md`(Task별 진행 보고), `.orch/runs/<run-id>/summary.md`
 
 ## Windows / macOS
@@ -144,7 +158,9 @@ claude와 gemini는 interface가 같은 backend로 대칭 구성됨.
   - 실패한 세션이 저장돼 있으면 그 세션을 이어서 답만 다시 요청함 → 이미 끝낸 검색·편집은 유지됨. 세션이 없으면 같은 호출을 처음부터 다시 실행함
   - 인증·예산·turn 상한·rate limit(429) 실패는 다시 해도 같으므로 재시도 안 함. 판정 기준은 backend별 `TRANSIENT_ERROR`
   - run.log에는 `<단계> retry1`로 기록되고 실패한 시도의 비용도 합산됨
-- **token 기록**: Claude 호출은 종료 줄에 비용과 함께 token 사용량이 남음. 예: `ok ($2.572; 31 turns, peak context 103k, cache read 2.0M, cache write 103k, input 1k, output 40k)`. `peak context`(가장 큰 요청)와 `cache read`가 크면 세션이 길게 늘어진 것임 (Gemini는 별도 `tokens:` 줄)
+- **token 기록**: Claude 호출은 종료 줄에 비용과 함께 token 사용량이 남음. 예: `ok ($2.572; 31 turns, peak context 103k, cache read 2.0M, cache write 103k, input 1k, output 40k, time 6m12s, API 5m40s, model claude-opus-5-5)`. `peak context`(가장 큰 요청)와 `cache read`가 크면 세션이 길게 늘어진 것임 (Gemini는 별도 `tokens:` 줄)
+  - token 합계는 result message의 usage 합계와 응답별 usage 합계 중 항목마다 큰 값임 (응답별 usage는 스트리밍 중간 값이라 output이 빠질 수 있음)
+  - `time`·`API`는 result message의 `duration_ms`·`duration_api_ms`, `model`은 `model_usage`의 model ID(subagent 포함, `+`로 연결)
 - **context 절약**: worker는 파일 전체 `cat` 대신 Grep + 필요한 범위만 Read하고 관련 수정은 한 번에 Edit하도록 지시받음 (`prompts/worker.md` "Working Economically"). reviewer 입력의 diff는 30k자까지만 넣고, 넘으면 변경 파일 목록 + 앞부분 + 나머지 파일 위치를 줌 (`review.REVIEW_DIFF_CHARS`)
 - **backend**: `agents/claude.py`(claude_agent_sdk), `agents/gemini.py`(Gemini CLI headless). 처음 호출될 때 import되므로 쓰지 않는 provider의 SDK·CLI는 필요 없음
 - **공통 규격**: 역할별 도구(`ROLE_TOOLS`, Claude Code 도구 이름 기준), structured output용 JSON schema(`AgentSpec.schema`), tool 진행 로그 형식은 `runner.py`에서 정의하고, 각 backend가 자기 방식으로 변환함

@@ -10,6 +10,7 @@ Lives in <project>/.orch/ and always works on <project>, the folder that contain
 Usage (via the launcher at the project root: orch.bat on Windows, orch.sh on macOS/Linux):
     orch                 run the pending tasks in TASKS.md      (PowerShell: .\\orch, macOS/Linux: ./orch.sh)
     orch preview         show tasks, reviewer pairs and the agent count without running anything
+    orch 60              run every 60 minutes until Ctrl+C - each run is a fresh process (Watch)
 Options: [--max-parallel N] [--max-rounds N] [--budget-per-agent USD] [--max-turns N]
          [--provider claude|gemini] [--model NAME] [--cli-path PATH] [--source file|notion]
 Their defaults, and the provider and model of each agent role, come from orch.toml at the project root
@@ -27,11 +28,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import itertools
 import logging
 import re
 import shutil
+import subprocess
 import sys
-from datetime import datetime
+import time
+from datetime import datetime, timedelta
 from pathlib import Path
 
 # Before the imports below, which need tomllib (3.11+): macOS's own /usr/bin/python3 is older
@@ -61,13 +65,27 @@ from workspace.sandbox import CreateSnapshot
 ROLE_SKILL_DIR = SKILL_DIR / "develop"
 MAX_LISTED_REFS = 5  # preview lists this many ref entries per task
 OWN_ID_PATTERN = re.compile(r"\bT(\d+)\b", re.IGNORECASE)  # a task ID in an "after:" or "ref:" value
+WATCH_CYCLE_FLAG = "--watch-cycle"  # Watch's child runs: "orch 60" runs once instead of scheduling again
+
+
+def Command(value: str) -> str | int:
+    """"run", "preview", or a whole number of minutes: "orch 60" runs every 60 minutes."""
+    if value in ("run", "preview"):
+        return value
+    if value.isdigit() and int(value) > 0:
+        return int(value)
+    raise argparse.ArgumentTypeError(f"use run, preview or a number of minutes (e.g. 60), not {value!r}")
 
 
 def ParseArgs(argv: list[str] | None, config: OrchConfig) -> argparse.Namespace:
     # Defaults come from orch.toml (or the built-in values), so --help shows what a run would use;
     # ranges are checked once on the final values (config.Problems)
     parser = argparse.ArgumentParser(prog="orch", description="Run TASKS.md through parallel work, review and merge.")
-    parser.add_argument("command", nargs="?", choices=["run", "preview"], default="run", help="default: run")
+    parser.add_argument(
+        "command", nargs="?", type=Command, default="run",
+        help="run (default), preview, or N: run every N minutes until Ctrl+C",
+    )
+    parser.add_argument(WATCH_CYCLE_FLAG, action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
         "--max-parallel", type=int, default=config.maxParallel, help="concurrent agents, 0 = automatic (default: %(default)s)"
     )
@@ -263,6 +281,41 @@ def SettleEarlierTasks(allTasks: list[Task]) -> None:
         if task.status != STATUS_DONE:
             task.error = f"status [{task.status}] in the task list, not done"
         task.doneEvent.set()
+
+
+def Runnable(task: Task) -> bool:
+    """Whether a pending task can run now: each "after:" task is done, or pending and runnable itself."""
+    return all(up.status == STATUS_DONE or (up.status == STATUS_PENDING and Runnable(up)) for up in task.upstream)
+
+
+def Watch(minutes: int, argv: list[str]) -> int:
+    """"orch 60": a run every 60 minutes, counted from the start of the last one, until Ctrl+C.
+
+    Each run is a fresh process, so the task list, orch.toml and code a [sys] task applied are read anew;
+    a run that takes longer than the interval is followed by the next one right away, never overlapped.
+    """
+    command = [sys.executable, str(Path(__file__).resolve()), *argv, WATCH_CYCLE_FLAG]
+    try:
+        for cycle in itertools.count(1):
+            start = time.monotonic()
+            print(f"watch: run {cycle} at {datetime.now():%Y-%m-%d %H:%M} (every {minutes} min, Ctrl+C stops)", flush=True)
+            if RunCycle(command) == 2:  # settings or task list error: keep watching, it may be fixed by the next run
+                print("watch: nothing ran - fix the error above; it is checked again at the next run", flush=True)
+            wait = max(0.0, start + minutes * 60 - time.monotonic())
+            print(f"watch: next run at {datetime.now() + timedelta(seconds=wait):%Y-%m-%d %H:%M}", flush=True)
+            time.sleep(wait)
+    except KeyboardInterrupt:
+        print("watch: stopped")
+    return 0
+
+
+def RunCycle(command: list[str]) -> int:
+    process = subprocess.Popen(command)
+    try:
+        return process.wait()
+    except KeyboardInterrupt:  # the run got the same Ctrl+C: let it put its tasks back to pending before stopping
+        process.wait()  # not subprocess.run, which kills the child 0.25 s after Ctrl+C
+        raise
 
 
 def RemoveWorkspaces(tasks: list[Task], ctx: RunContext) -> None:
@@ -491,6 +544,8 @@ def Main(argv: list[str] | None = None) -> int:
         print(f"error: {error}", file=sys.stderr)
     if errors:
         return 2
+    if isinstance(args.command, int) and not args.watch_cycle:  # "orch 60": this process only schedules the runs
+        return Watch(args.command, sys.argv[1:] if argv is None else argv)
     source, errors = CreateTaskSource(config, PROJECT_ROOT)  # TASKS.md, or the Notion database of [notion]
     for error in errors:
         print(f"error: {error}", file=sys.stderr)
@@ -514,6 +569,10 @@ def Main(argv: list[str] | None = None) -> int:
         print(f"notice: {notice}")
     if not pending:
         print(f"No pending tasks in {source.label}")
+        return 0
+    # A watch run with only blocked tasks would just leave an empty run in .orch/runs every interval
+    if args.watch_cycle and not any(Runnable(task) for task in pending):
+        print(f"{len(pending)} pending task(s) in {source.label}, all waiting on an \"after:\" task that did not succeed")
         return 0
     WarnMissingRoles(pending)
     parallel, reason = ResolveParallel(config, pending)

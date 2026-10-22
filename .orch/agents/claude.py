@@ -5,8 +5,9 @@
 - project rules and guards: setting_sources=["project"] - CLAUDE.md, .claude/settings.json deny rules and hooks
 - structured output: the SDK's json_schema output format
 - limits: budget_per_agent and max_turns per call; [claude] max_retries goes to the CLI as CLAUDE_CODE_MAX_RETRIES
-- token use: every API response's usage, summed into runner.TokenUsage (run.log, and the fix phase's choice
-  between resuming a session and starting a fresh one)
+- token use: the result message's usage totals, checked against every API response's usage, into runner.TokenUsage
+  with the call's duration, API duration and model IDs (run.log, and the fix phase's choice between resuming a
+  session and starting a fresh one)
 - transient errors: TRANSIENT_ERROR - a dropped connection, a timeout or a 5xx after the CLI's own retries; runner
   retries the call
 The SDK is imported on the first call, so preview, the sys smoke test and Gemini-only setups run without it.
@@ -116,27 +117,49 @@ def ToAgentResult(message: ResultMessage, tokens: TokenUsage | None = None) -> A
 
 
 class UsageCounter:
-    """Token use of one call, from the usage every API response carries.
+    """Token use of one call: the result message's totals, checked against the usage every API response carries.
 
-    The CLI emits one AssistantMessage per content block, all with the response's message id and usage, so each
-    response is counted once - by its last message, whose output count is complete. The largest request is the
-    session's peak context, which the fix phase uses to decide between resuming and a fresh session.
+    The CLI emits one AssistantMessage per content block, all with the response's message id. Their usage is a
+    snapshot taken while the response streams, so output_tokens there can stay at a few tokens even for a long reply;
+    the result message's usage is the session's real total. Each total is the larger of the two sources, so a
+    missing or partial result total never undercounts. The per-response counts still give the largest request -
+    the session's peak context, which the fix phase uses to decide between resuming and a fresh session.
     """
 
     def __init__(self) -> None:
         self.responses: dict[str, dict] = {}
+        self.models: list[str] = []
 
     def Count(self, message) -> None:
         usage = getattr(message, "usage", None)
         if isinstance(usage, dict):
             self.responses[getattr(message, "message_id", None) or str(len(self.responses))] = usage
+        model = getattr(message, "model", None)
+        if model and not model.startswith("<") and model not in self.models:  # skip "<synthetic>" API-error messages
+            self.models.append(model)
 
     def Tokens(self, final: ResultMessage | None = None) -> TokenUsage | None:
-        """The call's totals; without per-response usage, the result message's own totals (no peak then)."""
-        if not self.responses:
-            totals = getattr(final, "usage", None) if final else None
-            return UsageOf([totals], getattr(final, "num_turns", 0) or 0) if isinstance(totals, dict) else None
-        return UsageOf(list(self.responses.values()), len(self.responses))
+        """The call's totals, time and models; None when neither source reported any usage."""
+        totals = getattr(final, "usage", None) if final else None
+        if not self.responses and not isinstance(totals, dict):
+            return None
+        perResponse = UsageOf(list(self.responses.values()), len(self.responses))
+        tokens = perResponse
+        if isinstance(totals, dict):
+            reported = UsageOf([totals], getattr(final, "num_turns", 0) or 0)
+            tokens = TokenUsage(
+                turns=perResponse.turns or reported.turns,
+                inputTokens=max(perResponse.inputTokens, reported.inputTokens),
+                cacheReadTokens=max(perResponse.cacheReadTokens, reported.cacheReadTokens),
+                cacheWriteTokens=max(perResponse.cacheWriteTokens, reported.cacheWriteTokens),
+                outputTokens=max(perResponse.outputTokens, reported.outputTokens),
+                peakContext=perResponse.peakContext or reported.peakContext,
+            )
+        tokens.durationMs = int(getattr(final, "duration_ms", 0) or 0)
+        tokens.apiDurationMs = int(getattr(final, "duration_api_ms", 0) or 0)
+        modelUsage = getattr(final, "model_usage", None)
+        tokens.models = list(dict.fromkeys([*self.models, *(modelUsage if isinstance(modelUsage, dict) else {})]))
+        return tokens
 
 
 def UsageOf(usages: list[dict], turns: int) -> TokenUsage:
