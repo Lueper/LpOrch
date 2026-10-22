@@ -8,6 +8,9 @@
 - token use: the result message's usage totals, checked against every API response's usage, into runner.TokenUsage
   with the call's duration, API duration and model IDs (run.log, and the fix phase's choice between resuming a
   session and starting a fresh one)
+- cost: the result message's total_cost_usd is the session's total so far, so a resumed session (a fix, a retry, a
+  merge fix) also reports the calls it continues; the call's own share is what is left after the totals that session
+  reported last (OwnShare). Its duration_api_ms is a session total the same way; duration_ms is the call's own.
 - transient errors: TRANSIENT_ERROR - a dropped connection, a timeout or a 5xx after the CLI's own retries; runner
   retries the call
 The SDK is imported on the first call, so preview, the sys smoke test and Gemini-only setups run without it.
@@ -50,6 +53,25 @@ async def Run(label: str, prompt: str, spec: AgentSpec, ctx: RunContext, model: 
             error=f"{type(error).__name__}: {error}", sessionId=result.sessionId, costUsd=result.costUsd,
             tokens=result.tokens or usage.Tokens(),
         )
+    return OwnShare(result, spec, ctx)
+
+
+def OwnShare(result: AgentResult, spec: AgentSpec, ctx: RunContext) -> AgentResult:
+    """The call's own cost and API time, and the session's totals recorded for the next call that resumes it.
+
+    A resumed session reports what it cost since it began, so a fix that resumed its worker's session would count the
+    work a second time in run.log, summary.md and the budget figures - the totals the session reported last are taken
+    off. A forked session (ring review) is left as reported: whether its totals include the session it forked from
+    is not established.
+    """
+    apiMs = result.tokens.apiDurationMs if result.tokens else 0
+    earlier = ctx.sessionTotals.get(spec.resume) if spec.resume and not spec.fork else None
+    if result.sessionId:
+        ctx.sessionTotals[result.sessionId] = (result.costUsd, apiMs)
+    if earlier and result.sessionId == spec.resume:
+        result.costUsd = max(result.costUsd - earlier[0], 0.0)
+        if result.tokens and apiMs:
+            result.tokens.apiDurationMs = max(apiMs - earlier[1], 0)
     return result
 
 

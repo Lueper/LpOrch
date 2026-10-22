@@ -36,7 +36,14 @@ Indent lines under a task (2+ spaces) to add detailed instructions. These detail
                       text files are put straight into the prompt, and the reviewer checks the result against them.
   ref: T03            T03's result as base material, plus how it was reviewed (findings and the
                       author's responses, read from T03's run). Waits for T03 if it runs in the same run.
+                      Task IDs may share a line and sit next to paths: "ref: T03, T04", "ref: T03, doc/x.md".
                       Preview shows a notice when a done task was built on an older result than the current one.
+  ref: T01 (origin)   written by the orchestrator under a follow-up: T01 is the task a person wrote that the
+                      follow-up chain started from - its goal - and works as "ref: T01" otherwise
+  todo: <to-do>       what only a person can do (merge, commit, decide, ...). While it is there, this task and
+                      every task built on it ("after:", "ref: Txx") wait. Delete the line or mark it
+                      "todo: [x] <to-do>" once done. Agents and the orchestrator (a code result it could not
+                      apply) write these lines too
   lang: en            output language of a doc deliverable (default: Korean)
   verify: <command>   shell command that must pass for code/sys tasks (e.g. pytest -q); it runs in cmd.exe on
                       Windows and /bin/sh on macOS, so a task list shared by both needs a command both run
@@ -46,16 +53,22 @@ Indent lines under a task (2+ spaces) to add detailed instructions. These detail
                       "after:" and "ref: Txx" read it (leave it as is, or delete it before a re-run)
 
 Status: [ ] pending, [~] running, [x] done, [!] failed. Set a task back to [ ] to retry it.
-A task whose "after:" task did not succeed stays [ ] (blocked) and runs again next time.
+A task whose "after:" task did not succeed stays [ ] (blocked) and runs again next time; one held back by an
+open "todo:" is shown as "waiting:" and does not start until the to-do is done.
 
 A task that succeeds may also add tasks here itself: when its agents found work that needs a task of its own
-(outside the task's scope, waiting on a decision, a problem they must not fix there), the orchestrator appends
-it as a new pending task at the end of the list, with the detail lines the agent asked for - up to 5 per task.
-Each proposal is reviewed with the task's result, and a detail line that would stop the next run (an unknown
-"after:" task, a "ref:" that matches nothing) is dropped. The run log and the progress report say what was
-added; review the new lines like your own and delete what you do not want. Failed tasks add nothing (they run
-again), and a title already in the list is not added twice. Set follow_ups = false under [tasks] in orch.toml
-to turn this off: agents are then not asked for follow-ups and nothing is written here.
+(outside the task's scope, a problem they must not fix there), the orchestrator appends it as a new pending task
+at the end of the list, with the detail lines the agent asked for - up to 5 per task. Each follow-up gets
+"ref: <origin> (origin)" (the task a person wrote that the chain started from) and "after: <the task that
+proposed it>"; a chain grows at most max_followup_depth generations and max_followups_per_origin follow-ups
+([tasks] in orch.toml), and what a limit stops is noted in the reports instead. What only a person can do is
+written as a "todo:" line under the task instead of a new task. Each proposal is reviewed with the task's result,
+and a detail line that would stop the next run (an unknown "after:" task, a "ref:" that matches nothing) is
+dropped. The run log and the progress report say what was added; review the new lines like your own and delete
+what you do not want. Failed tasks add nothing (they run again), and a title already in the list is not added
+twice. Set follow_ups = false under [tasks] in orch.toml to turn this off: agents are then not asked for
+follow-ups and nothing is written here. When an origin's chain has ended or waits on a person, a Korean goal
+report says what it achieved against the origin's goal (report/[Txx]_<YYMMDD>_목표_보고_<title>.md).
 
 The task list can also live in a Notion database instead of this file: set source = "notion" under [tasks]
 in orch.toml and the database link under [notion]. One row is then one task, with the properties task (the ID,
@@ -73,7 +86,8 @@ Reset:    orch-reset      (PowerShell: .\orch-reset, macOS/Linux: ./orch-reset.s
           report/*.md, run logs and this task list (the header stays) after showing counts and asking;
           "orch-reset --yes" skips the question
 Results:  docs -> doc/[Txx]_<YYMMDD>_<Korean title>.md (one document per task, content only)
-          code -> staged, uncommitted changes per task (review with git diff --cached)
+          code -> staged, uncommitted changes per task (review with git diff --cached); a run's code results are
+                  merged one after another, and one that cannot be applied leaves its patch and a "todo:"
           sys  -> applied to the system files; originals in .orch/runs/<run-id>/<Txx>/backup/
           test -> the progress report only
           task -> new pending tasks at the end of this list (the progress report names their IDs)

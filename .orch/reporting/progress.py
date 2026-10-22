@@ -69,6 +69,7 @@ def FactSheet(task: Task, ctx: RunContext) -> str:
         f"- Result location: {task.resultRef or '-'}",
         f"- Error: {task.error or '-'}",
         f"- Notes: {'; '.join(task.notes) or '-'}",
+        f"- To-dos for a person under the task (todo: lines): {'; '.join(task.todoOpen) or '-'}",
         f"- Total cost (USD, before this report): {task.totalCostUsd:.3f}",
     ]
     if task.planNote:

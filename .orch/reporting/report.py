@@ -7,16 +7,21 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import datetime
 from pathlib import Path
-from typing import Union
+from typing import TYPE_CHECKING, Union
 
 from core.runcontext import RunContext
 from core.tasks import NeedsRevision, Part, Task
+
+if TYPE_CHECKING:
+    from reporting.goal import GoalReport
 
 SEVERITIES = ("CRITICAL", "WARNING", "INFO")
 Subject = Union[Part, Task]
 MAX_HISTORY_CHARS = 8_000  # per upstream task; the full artifacts stay readable in its run folder
 ROUND_NUMBER = re.compile(r"\.r(\d+)\.")
+TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 
 def Cell(value: object) -> str:
@@ -94,6 +99,18 @@ def SeverityCounts(subjects: list[Subject]) -> list[int]:
     return [severities.count(level) for level in SEVERITIES]
 
 
+def Elapsed(start: datetime | None, end: datetime | None) -> str:
+    """"0:12:34 (754s)": readable and exact; "-" when either end is missing."""
+    if start is None or end is None:
+        return "-"
+    seconds = round((end - start).total_seconds())
+    return f"{seconds // 3600}:{seconds // 60 % 60:02d}:{seconds % 60:02d} ({seconds}s)"
+
+
+def Clock(moment: datetime | None) -> str:
+    return moment.strftime(TIME_FORMAT) if moment else "-"
+
+
 def CheckState(subject: Subject) -> str:
     return {None: "-", True: "passed", False: "FAILED"}[subject.checkOk]
 
@@ -120,6 +137,8 @@ def TaskRow(task: Task) -> str:
         ReviewState(task) if task.reviews else "-",
         CheckState(task) if len(task.parts) > 1 else CheckState(task.parts[0]) if task.parts else "-",
         f"{task.totalCostUsd:.3f}",
+        Clock(task.startedAt),
+        Elapsed(task.startedAt, task.finishedAt),
         "; ".join(item for item in [task.error, task.result, *task.notes] if item),
     ])
 
@@ -137,24 +156,31 @@ def PartRow(part: Part) -> str:
     ])
 
 
-def WriteRunSummary(tasks: list[Task], ctx: RunContext, completed: bool) -> str:
+def WriteRunSummary(tasks: list[Task], ctx: RunContext, completed: bool, goals: list[GoalReport] | None = None) -> str:
+    goals = goals or []
+    finishedAt = datetime.now()
     lines = [
         f"# Run {ctx.runId}",
         "",
         f"- Completed: {'yes' if completed else 'NO - aborted, unfinished tasks reset to pending'}",
         f"- Project: {ctx.projectDir}",
         f"- Artifacts: {ctx.runDir}",
+        f"- Started: {Clock(ctx.startedAt)}",
+        f"- Finished: {Clock(finishedAt)}",
+        f"- Elapsed: {Elapsed(ctx.startedAt, finishedAt)}",
         "",
-        "| Task | Kind | Status | Parts | Approved | Findings C/W/I | Fixes | Integration | Checks | Cost (USD) | Result / Note |",
-        "|---|---|---|---|---|---|---|---|---|---|---|",
+        "| Task | Kind | Status | Parts | Approved | Findings C/W/I | Fixes | Integration | Checks | Cost (USD) | Started | Duration | Result / Note |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|",
         *(TaskRow(task) for task in tasks),
         "",
         "| Part | Title | Review | Findings C/W/I | Fixes | Checks | Cost (USD) | Note |",
         "|---|---|---|---|---|---|---|---|",
         *(PartRow(part) for task in tasks for part in task.parts),
         "",
+        *TodoLines(tasks),
         *ReportLines(tasks),
-        f"Total: ${sum(task.totalCostUsd for task in tasks):.3f}",
+        *GoalLines(goals),
+        f"Total: ${sum(task.totalCostUsd for task in tasks) + sum(goal.costUsd for goal in goals):.3f}",
     ]
     text = "\n".join(lines) + "\n"
     (ctx.runDir / "summary.md").write_text(text, encoding="utf-8")
@@ -165,6 +191,20 @@ def ReportLines(tasks: list[Task]) -> list[str]:
     """Where each code task's Korean progress report went; none for blocked tasks or aborted runs."""
     reports = [f"- {task.id}: {task.reportRef}" for task in tasks if task.reportRef]
     return ["Progress reports (Korean):", *reports, ""] if reports else []
+
+
+def TodoLines(tasks: list[Task]) -> list[str]:
+    """The to-dos a person has under this run's tasks: they hold back every task built on them until done."""
+    todos = [f"- {task.id}: {item}" for task in tasks for item in task.todoOpen]
+    if not todos:
+        return []
+    return ["To-dos for a person (todo: lines in the task list; delete or mark todo: [x] ... once done):", *todos, ""]
+
+
+def GoalLines(goals: list[GoalReport]) -> list[str]:
+    """Where each goal report went: an origin whose follow-up chain ended or waits on a person."""
+    reports = [f"- {goal.originId}: {goal.path} (${goal.costUsd:.3f})" for goal in goals]
+    return ["Goal reports (Korean):", *reports, ""] if reports else []
 
 
 # ---------- history for later tasks ----------

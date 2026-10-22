@@ -32,6 +32,8 @@ def ResolveRefs(task: Task, projectDir: Path) -> list[str]:
         task.refFiles += [path for path in files if path not in task.refFiles]
     task.refDirs = sorted({path.parent for path in task.refFiles if not path.is_relative_to(projectDir.resolve())})
     for up in RefTasks(task):  # tasks of this run are checked once they finish (AddRefResults)
+        if up.id == task.origin:  # the origin names the goal; a lost result file must not stop its follow-ups
+            continue
         if up.status == STATUS_DONE and not ResultFiles(up, projectDir):
             errors.append(f"{task.id} ref: {up.id} has no result file to build on ({up.resultRef or 'none recorded'})")
     return errors
@@ -166,6 +168,14 @@ def TaskContext(task: Task, embedRefs: bool = False, withHistory: bool = False) 
     if task.upstream:
         lines.append("Builds on these earlier tasks - read their results and treat them as given inputs:")
         lines += [f"- {up.id} ({up.kind}) {up.title}: {up.resultRef or 'location not recorded'}" for up in task.upstream]
+    origin = next((up for up in task.upstream if up.id == task.origin), None)
+    if origin:
+        lines.append(
+            f"Origin goal: {origin.id} ({origin.kind}) {origin.title} - this task is a follow-up added to serve that"
+            " goal. Do what moves the goal forward; work that only polishes tools or re-checks around it does not."
+        )
+    if task.todoDone:
+        lines += ["Done by a person for this task (its \"todo:\" lines marked [x]):", *(f"- {item}" for item in task.todoDone)]
     if withHistory and task.history:
         lines += [
             "How those earlier results were reviewed (findings and the author's responses) - keep what was approved "

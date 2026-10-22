@@ -12,7 +12,8 @@ import re
 from pathlib import Path
 
 from core.tasks import (
-    MODE_FULL, MODE_STANDARD, SINGLE_PART_KINDS, STATUS_PENDING, TASK_KINDS, FollowUp, Task, TaskFileError,
+    MODE_FULL, MODE_STANDARD, ORIGIN_MARKER, SINGLE_PART_KINDS, STATUS_PENDING, TASK_KINDS, FollowUp, Task,
+    TaskFileError,
 )
 
 KINDS = "|".join(TASK_KINDS)  # "doc|code|sys|test|task", for the patterns below
@@ -32,12 +33,19 @@ DETAIL_PATTERN = re.compile(r"^(?:\s{2,}|\t)(?P<text>\S.*?)\s*$")
 # Detail lines that configure the task instead of describing it
 # An optional leading arrow marks lines the orchestrator wrote ("→ result: ...")
 DIRECTIVE_PATTERN = re.compile(
-    r"^(?:(?:→|->)\s*)?(?P<key>after|ref|lang|verify|mode|result)\s*:\s*(?P<value>.*)$", re.IGNORECASE
+    r"^(?:(?:→|->)\s*)?(?P<key>after|ref|lang|verify|mode|result|todo)\s*:\s*(?P<value>.*)$", re.IGNORECASE
 )
 RESULT_ARROW = "→"
 RESULT_RUN_PATTERN = re.compile(r"^(?P<ref>.*?)\s*\(run (?P<run>\d{8}-\d{6})\)$")  # "doc/x.md (run 20261008-101500)"
 TASK_ID_PATTERN = re.compile(r"T(\d+)", re.IGNORECASE)
-TASK_REF_PATTERN = re.compile(r"^T(\d+)$", re.IGNORECASE)  # "ref: T03" = T03's result
+# "ref: T03" = T03's result; "ref: T01 (origin)" also names T01 as the goal a follow-up chain serves
+TASK_REF_PATTERN = re.compile(rf"^T(\d+)(?P<origin>\s*{re.escape(ORIGIN_MARKER)})?$", re.IGNORECASE)
+TASK_REF_ITEM = re.compile(rf"T\d+(?:\s*{re.escape(ORIGIN_MARKER)})?", re.IGNORECASE)
+# Several task IDs on one "ref:" line: "T01, T02", "T01 T02", "T01; T02 (origin)"
+TASK_REF_LIST = re.compile(rf"^{TASK_REF_ITEM.pattern}(?:[\s,;]+{TASK_REF_ITEM.pattern})*$", re.IGNORECASE)
+# "todo: [x] ..." is a to-do a person marked as done; it no longer holds anything up
+TODO_DONE_PATTERN = re.compile(r"^\[\s*x\s*\]\s*(?P<text>.*)$", re.IGNORECASE)
+TODO_KIND = "todo"  # "- [todo] <what a person must do>" in a follow-up block: written under the task as "todo:"
 # An agent lists the follow-up tasks it asks for below this line in its final message (pipeline/phases.py)
 FOLLOWUP_MARKER = "=== FOLLOW-UP TASKS ==="
 SECTION_MARKER = re.compile(r"^\s*===\s.+\s===\s*$")  # the "=== X ===" lines an agent's final message is split at
@@ -45,6 +53,9 @@ SECTION_MARKER = re.compile(r"^\s*===\s.+\s===\s*$")  # the "=== X ===" lines an
 FOLLOWUP_PATTERN = re.compile(
     rf"^(?:[-*+]\s*)?(?:\[\s*[x~!]?\s*\]\s*)?\[(?P<kind>{KINDS})(?::(?P<role>[\w-]+))?\]\s*(?P<title>\S.*?)\s*$",
     re.IGNORECASE,
+)
+TODO_ITEM_PATTERN = re.compile(
+    rf"^(?:[-*+]\s*)?(?:\[\s*[x~!]?\s*\]\s*)?\[{TODO_KIND}\]\s*(?P<text>\S.*?)\s*$", re.IGNORECASE
 )
 # A list item in a follow-up block that FOLLOWUP_PATTERN did not read ("1. [code] x", "- **[code] x**", "- x"):
 # reported instead of being dropped in silence, like UnreadTaskLines does for the file
@@ -149,12 +160,23 @@ def AddDetail(task: Task, text: str) -> None:
     key, value = directive["key"].lower(), directive["value"].strip()
     if key == "after":
         task.after += [f"T{int(number):02d}" for number in TASK_ID_PATTERN.findall(value)]
-    elif key == "ref" and TASK_REF_PATTERN.match(value):  # a task ID: build on its result, waiting if it runs now
-        taskId = f"T{int(TASK_REF_PATTERN.match(value)[1]):02d}"
-        task.refTaskIds.append(taskId)
-        task.after.append(taskId)
     elif key == "ref":
-        task.refs += [value] if value else []
+        for entry in RefEntries(value):
+            match = TASK_REF_PATTERN.match(entry)
+            if not match:  # a file, folder, glob or URL
+                task.refs.append(entry)
+                continue
+            taskId = f"T{int(match[1]):02d}"  # a task ID: build on its result, waiting if it runs now
+            task.refTaskIds.append(taskId)
+            task.after.append(taskId)
+            if match["origin"]:
+                task.origin = taskId
+    elif key == "todo":  # a to-do for a person; "[x]" marks it done
+        done = TODO_DONE_PATTERN.match(value)
+        if done:
+            task.todoDone += [done["text"].strip()] if done["text"].strip() else []
+        elif value:
+            task.todoOpen.append(value)
     elif key == "lang":
         task.lang = value or None
     elif key == "verify":
@@ -166,10 +188,26 @@ def AddDetail(task: Task, text: str) -> None:
         task.resultRef, task.resultRun = (withRun["ref"], withRun["run"]) if withRun else (value, "")
 
 
+def RefEntries(value: str) -> list[str]:
+    """The base materials of one "ref:" value, each a task ID ("T01", "T01 (origin)") or a path, glob or URL.
+
+    Task IDs may share a line - "T01, T02", "T01 T02" - and sit next to paths: "T01, doc/x.md". A value none of
+    whose comma-separated pieces holds a task ID stays one entry, commas and all, so a path with a comma still works.
+    """
+    pieces = [piece.strip() for piece in value.split(",") if piece.strip()]
+    if not any(TASK_REF_LIST.match(piece) for piece in pieces):
+        return [value] if value else []
+    entries: list[str] = []
+    for piece in pieces:
+        entries += [item[0] for item in TASK_REF_ITEM.finditer(piece)] if TASK_REF_LIST.match(piece) else [piece]
+    return entries
+
+
 # ---------- follow-up tasks ----------
 
-def SplitFollowUps(text: str, origin: str = "") -> tuple[str, list[FollowUp], list[str]]:
-    """(the message without its follow-up block, the follow-up tasks listed in it, the lines not read as one).
+def SplitFollowUps(text: str, proposedBy: str = "") -> tuple[str, list[FollowUp], list[str], list[str]]:
+    """(the message without its follow-up block, the follow-up tasks listed in it, its "[todo]" items for a person,
+    the lines not read as either).
 
     The block runs from FOLLOWUP_MARKER to the next "=== ... ===" section or the end of the message, so an agent
     may put it anywhere after its output - before or after the notes and review-response sections, which are
@@ -178,34 +216,52 @@ def SplitFollowUps(text: str, origin: str = "") -> tuple[str, list[FollowUp], li
     lines = text.splitlines(keepends=True)
     start = next((index for index, line in enumerate(lines) if line.strip() == FOLLOWUP_MARKER), None)
     if start is None:
-        return text, [], []
+        return text, [], [], []
     end = next((index for index in range(start + 1, len(lines)) if SECTION_MARKER.match(lines[index])), len(lines))
-    items, unread = ParseFollowUps("".join(lines[start + 1:end]), origin)
-    return "".join(lines[:start] + lines[end:]), items, unread
+    items, todos, unread = ParseFollowUps("".join(lines[start + 1:end]), proposedBy)
+    return "".join(lines[:start] + lines[end:]), items, todos, unread
 
 
-def ParseFollowUps(block: str, origin: str = "") -> tuple[list[FollowUp], list[str]]:
-    """(the follow-up tasks of a block, the list items in it that are not readable as one).
+def ParseFollowUps(block: str, proposedBy: str = "") -> tuple[list[FollowUp], list[str], list[str]]:
+    """(the follow-up tasks of a block, its "[todo]" items for a person, the list items readable as neither).
 
-    A task line follows the task list's own syntax ("- [code] title" plus indented detail lines); prose and
-    empty lines are left out, while a list item that was meant as a task but cannot be read is reported.
+    A task line follows the task list's own syntax ("- [code] title" plus indented detail lines); a to-do is
+    "- [todo] <what a person must do>", indented lines continuing it. Prose and empty lines are left out, while a
+    list item that was meant as a task but cannot be read is reported.
     """
     items: list[FollowUp] = []
+    todos: list[str] = []
     unread: list[str] = []
     current: FollowUp | None = None
+    inTodo = False
     for line in block.splitlines():
         text = line.rstrip()
         detail = DETAIL_PATTERN.match(text)
         if current and detail:  # same rule as ParseTasks: an indented line configures the task above it
             current.details.append(detail["text"])
             continue
+        if inTodo and detail:  # a to-do written over several lines is one to-do
+            todos[-1] += f" {detail['text']}"
+            continue
+        todo = TODO_ITEM_PATTERN.match(text.strip())
+        inTodo = bool(todo)
+        if todo:
+            todos.append(todo["text"])
+            current = None
+            continue
         match = FOLLOWUP_PATTERN.match(text.strip())
-        current = FollowUp(match["kind"].lower(), match["role"], match["title"], origin=origin) if match else None
+        current = FollowUp(match["kind"].lower(), match["role"], match["title"], proposedBy=proposedBy) if match else None
         if current:
             items.append(current)
         elif UNREAD_FOLLOWUP_PATTERN.match(text.strip()):
             unread.append(text.strip())
-    return items, unread
+    return items, todos, unread
+
+
+def TodoLine(text: str) -> str:
+    """A to-do for a person as its detail line: one line, however the agent wrapped it."""
+    oneLine = re.sub(r"\s+", " ", text).strip()
+    return f"todo: {oneLine}"
 
 
 def AppendTask(path: Path, followUp: FollowUp) -> str:
@@ -318,6 +374,22 @@ def IsResultLine(line: str) -> bool:
     detail = DETAIL_PATTERN.match(line.rstrip("\r\n"))
     directive = DIRECTIVE_PATTERN.match(detail["text"]) if detail else None
     return bool(directive) and directive["key"].lower() == "result"
+
+
+def AddTodos(path: Path, task: Task, todos: list[str]) -> None:
+    """Write to-dos for a person under a task as "todo:" detail lines, after its other details and before its
+    "→ result:" line. They hold back every task that builds on it until a person deletes them or marks them [x]."""
+    lines = ReadLines(path)
+    lineNo = LocateTask(lines, path, task)
+    newline = next((LineEnding(line) for line in lines if LineEnding(line)), "\n")
+    end = lineNo + 1
+    while end < len(lines) and DETAIL_PATTERN.match(lines[end].rstrip("\r\n")):
+        end += 1
+    at = next((index for index in range(lineNo + 1, end) if IsResultLine(lines[index])), end)
+    if at > 0 and not LineEnding(lines[at - 1]):  # the block may end the file unterminated
+        lines[at - 1] += newline
+    lines[at:at] = [f"  {TodoLine(todo)}{newline}" for todo in todos]
+    WriteLines(path, lines)
 
 
 def RecordResult(path: Path, task: Task) -> None:

@@ -9,6 +9,7 @@ import subprocess
 from pathlib import Path
 
 FALLBACK_IDENTITY = ["-c", "user.name=orchestrator", "-c", "user.email=orchestrator@localhost"]
+NO_CHANGES = "no file changes"  # ApplyToWorkingTree: the result adds nothing the working tree does not hold yet
 CONFLICT_MARKER = re.compile(r"^(<{7}|>{7})( |$)", re.MULTILINE)
 # Caches that workers create by running tests; never commit them even if the repo lacks a .gitignore
 COMMIT_EXCLUDES = [
@@ -50,6 +51,31 @@ def ResolveRepo(path: Path) -> tuple[Path, str] | None:
     if root.returncode != 0 or head.returncode != 0:
         return None
     return Path(root.stdout.strip()), head.stdout.strip()
+
+
+def SnapshotCommit(repo: Path) -> tuple[str, bool]:
+    """(the commit code tasks start from, whether it holds uncommitted changes): HEAD plus the working tree's staged
+    and unstaged changes to tracked files, as a commit that touches neither the working tree nor the index
+    (git stash create). Results a person has not committed yet - earlier runs' staged code - are then the base
+    instead of a conflict. Untracked files are not in it; HEAD alone when nothing is uncommitted."""
+    stash = Git(repo, *IdentityArgs(repo), "stash", "create", "orch: run base", check=False).stdout.strip()
+    if stash:
+        return stash, True
+    return Git(repo, "rev-parse", "HEAD").stdout.strip(), False
+
+
+def RevParse(worktree: Path, revision: str = "HEAD") -> str:
+    return Git(worktree, "rev-parse", revision).stdout.strip()
+
+
+def ResetHard(worktree: Path, commit: str) -> None:
+    """Move a worktree of the orchestrator's own (never the project's) back to commit, dropping what came after."""
+    Git(worktree, "reset", "--hard", "-q", commit)
+
+
+def DiffPatch(repo: Path, base: str, branch: str) -> str:
+    """The branch's change as a patch a person can apply with git apply --3way."""
+    return Git(repo, "diff", "--binary", base, branch).stdout
 
 
 def CreateWorktree(repo: Path, path: Path, branch: str, base: str) -> None:
@@ -101,7 +127,7 @@ def HasConflictMarkers(worktree: Path, files: list[str]) -> bool:
 
 
 def FinishMerge(worktree: Path) -> None:
-    Git(worktree, "add", "-A")
+    Git(worktree, "add", "-A", "--", ".", *COMMIT_EXCLUDES)  # a merger that ran tests leaves caches behind
     Git(worktree, *IdentityArgs(worktree), "commit", "--no-edit")
 
 
@@ -116,17 +142,20 @@ def ChangedFiles(repo: Path, base: str, branch: str) -> list[tuple[str, str]]:
 
 
 def LocalChanges(repo: Path, base: str, paths: list[str]) -> list[str]:
-    """Paths the user touched since base: new commits, uncommitted edits, or untracked files in the way."""
-    committed = Git(repo, "diff", "--name-only", base, "HEAD", "--", *paths).stdout.splitlines()
-    status = Git(repo, "status", "--porcelain", "--untracked-files=all", "--", *paths).stdout.splitlines()
-    return sorted({*committed, *(line[3:] for line in status)} - {""})
+    """Paths whose working-tree content is no longer base's - edited, staged or deleted since - and untracked or
+    ignored files in the way of a file the change adds: the user's work, which applying must not overwrite.
+    Content is what counts, so committing the very same changes meanwhile is no conflict."""
+    edited = Git(repo, "diff", "--name-only", "--no-renames", base, "--", *paths).stdout.splitlines()
+    untracked = Git(repo, "ls-files", "--others", "--", *paths).stdout.splitlines()
+    return sorted({*edited, *untracked} - {""})
 
 
 def ApplyToWorkingTree(repo: Path, base: str, branch: str) -> str | None:
-    """Stage branch's changes in the main working tree without committing; returns why it was skipped."""
+    """Stage branch's changes over base in the main working tree without committing; returns why it was skipped.
+    base is what the working tree was last brought to: the run's snapshot, or the last result applied."""
     changes = ChangedFiles(repo, base, branch)
     if not changes:
-        return "no file changes"
+        return NO_CHANGES
     # Never overwrite the user's own work: all-or-nothing, only onto files untouched since base
     conflicts = LocalChanges(repo, base, [path for _, path in changes])
     if conflicts:

@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import re
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 STATUS_PENDING = " "
@@ -26,6 +27,7 @@ MODE_FULL = "full"
 MAX_PARTS = 4  # parallel agents per "mode: full" task; the planner picks 1..MAX_PARTS
 MAX_FOLLOWUPS = 5  # follow-up tasks one task may add to the task list; more means the agent is planning, not noting
 MAX_WRITTEN_TASKS = 20  # tasks one [task] task may write: planning is its job
+ORIGIN_MARKER = "(origin)"  # "ref: T01 (origin)": the task a follow-up chain started from, i.e. the goal it serves
 DEFAULT_DOC_LANG = "Korean"  # doc deliverables; "lang:" overrides per task
 LANG_NAMES = {"ko": "Korean", "kr": "Korean", "en": "English", "ja": "Japanese"}
 SYS_APPLIED_PREFIX = "applied to the project: "  # a sys task's changed files: its result until its report replaces it
@@ -57,7 +59,7 @@ class FollowUp:
     role: str | None  # optional role skill, as in "[code:refactorer]"
     title: str
     details: list[str] = field(default_factory=list)  # detail lines as written: "ref: ...", "verify: ...", ...
-    origin: str = ""  # the part or task whose agent proposed it
+    proposedBy: str = ""  # the part or task whose agent proposed it
 
     @property
     def key(self) -> tuple[str, str]:
@@ -80,6 +82,9 @@ class Task:
     refUrls: list[str] = field(default_factory=list)
     refDirs: list[Path] = field(default_factory=list)  # folders of ref files outside the project, opened to agents
     refTaskIds: list[str] = field(default_factory=list)  # "ref: T03": that task's result file is a base material
+    origin: str = ""  # "ref: T01 (origin)": the task whose goal this follow-up serves; empty for a task a person wrote
+    todoOpen: list[str] = field(default_factory=list)  # "todo:" lines: what a person must do before work goes on
+    todoDone: list[str] = field(default_factory=list)  # "todo: [x] ..." lines a person marked as done
     lang: str | None = None  # "lang:" output language of a doc deliverable
     verify: str | None = None  # "verify:" shell command that must pass (code/sys)
     mode: str = MODE_STANDARD  # "mode: full" opts into the multi-agent pipeline
@@ -94,6 +99,10 @@ class Task:
     responses: list[str] = field(default_factory=list)  # fixer's answers to those reviews
     followUps: list[FollowUp] = field(default_factory=list)  # follow-up tasks the merger or integration fixer asked for
     writtenTasks: list[FollowUp] = field(default_factory=list)  # task: its result, added to the task list at the end
+    # To-dos for a person found this run: the merger's, integration fixer's or [task] writer's, and the orchestrator's
+    # own (a code result it could not apply); written under the task as "todo:" lines when the run ends
+    todoAsked: list[str] = field(default_factory=list)
+    gitBase: str | None = None  # code: the commit its worktrees start from (the run's applied code results so far)
     revisions: int = 0
     checkOk: bool | None = None  # automated checks on the integrated result; None = not run
     checkOutput: str = ""
@@ -106,6 +115,8 @@ class Task:
     reportRef: str = ""  # Korean progress report, written when the run ends (reporting/progress.py), for the summary
     notes: list[str] = field(default_factory=list)
     finished: bool = False
+    startedAt: datetime | None = None  # when its phases began (after waiting for upstream); None = never started
+    finishedAt: datetime | None = None
     doneEvent: asyncio.Event = field(default_factory=asyncio.Event, repr=False)  # downstream tasks wait on it
 
     @property
@@ -151,6 +162,7 @@ class Part:
     reviews: list[dict] = field(default_factory=list)
     responses: list[str] = field(default_factory=list)  # worker's answers to each review it addressed
     followUps: list[FollowUp] = field(default_factory=list)  # follow-up tasks this part's worker asked for
+    todoAsked: list[str] = field(default_factory=list)  # "[todo]" items this part's worker listed for a person
     revisions: int = 0
     checkOk: bool | None = None  # automated checks (code/sys); None = not run
     checkOutput: str = ""
@@ -176,6 +188,43 @@ def FollowUpsOf(task: Task) -> list[FollowUp]:
     for item in [*(entry for part in task.parts for entry in part.followUps), *task.followUps]:
         unique.setdefault(item.key, item)
     return list(unique.values())
+
+
+def TodosAsked(task: Task) -> list[str]:
+    """Every to-do for a person this run found for the task, its parts' first, duplicates and open ones dropped."""
+    asked = [*(item for part in task.parts for item in part.todoAsked), *task.todoAsked]
+    return [item for item in dict.fromkeys(asked) if item not in task.todoOpen]
+
+
+def OpenTodos(task: Task) -> list[str]:
+    """What a person still has to do before work that builds on the task goes on: its open "todo:" lines, plus the
+    to-dos this run found for it - those count only once the task succeeded, as only then are they written."""
+    return [*task.todoOpen, *(TodosAsked(task) if task.ok and not task.blocked else [])]
+
+
+def TodoBlockers(task: Task, seen: set[str] | None = None) -> list[str]:
+    """"Txx: <to-do>" for each to-do a person must do before a pending task can run: its own open "todo:" lines and
+    those of the tasks it builds on - a done one's directly, a pending one's with everything it waits for in turn."""
+    seen = set() if seen is None else seen
+    if task.id in seen:
+        return []
+    seen.add(task.id)
+    blockers = [f"{task.id}: {item}" for item in task.todoOpen]
+    for up in task.upstream:
+        if up.status == STATUS_DONE:
+            blockers += [f"{up.id}: {item}" for item in up.todoOpen]
+        elif up.status == STATUS_PENDING:
+            blockers += TodoBlockers(up, seen)
+    return list(dict.fromkeys(blockers))
+
+
+def FollowUpDepth(task: Task, seen: frozenset[str] = frozenset()) -> int:
+    """How many follow-up generations the task is from its origin: 0 for a task a person wrote, 1 for a follow-up of
+    it, ... - counted along the tasks it builds on that share its origin (the task that proposed it among them)."""
+    if not task.origin or task.id in seen:
+        return 0
+    chain = [up for up in task.upstream if up.id == task.origin or up.origin == task.origin]
+    return 1 + max((FollowUpDepth(up, seen | {task.id}) for up in chain), default=0)
 
 
 def HasCritical(review: dict) -> bool:

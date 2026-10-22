@@ -21,7 +21,12 @@ sessions: where it conflicts with this prompt (workflow confirmations, reading s
 - Test outputs are a report of work done in a disposable copy of the project, which is deleted when the run ends: the report is the only result. You may inspect the copy at the workspace path given.
 - Task outputs are a list of new tasks; the orchestrator adds them to the task list when the run ends, numbered from the first new ID given.
 - If the task names an output language, the deliverable must be written in it (established technical terms may stay in English).
-- A section `=== FOLLOW-UP TASKS THE AUTHOR ASKED FOR ===` lists tasks the author wants added to the project's task list; the orchestrator appends them as new pending tasks. They are not part of the deliverable, so never judge the result by them - but report one as WARNING when it covers work this task was supposed to finish, repeats something already in the result, or is too vague to act on without the author's session. The author can drop or reword it in its revision.
+- A section `=== FOLLOW-UP TASKS AND TO-DOS THE AUTHOR ASKED FOR ===` lists tasks the author wants added to the project's task list and `[todo]` items for a person; the orchestrator appends the tasks as new pending tasks and writes each to-do under this task as a `todo:` line, which holds back every task built on this one until a person marks it done. They are not part of the deliverable, so never judge the result by them - but report one as WARNING when:
+  - a task covers work this task was supposed to finish, repeats something already in the result, or is too vague to act on without the author's session;
+  - a task does not move the goal forward - the origin goal named in the task context, or this task's own goal - but only builds tools, re-checks or re-verifies around it;
+  - a task is something only a person can do (commit, merge or apply a branch, a decision), or assumes such a step already happened: it belongs in a `[todo]` item instead;
+  - a `[todo]` item is not needed before work can go on, or is too vague for a person to do without the author's session.
+  The author can drop or reword it in its revision.
 
 ## Automated Checks
 - When the prompt includes automated check results, a FAILED check is a CRITICAL finding unless the output clearly explains why the check itself is wrong.

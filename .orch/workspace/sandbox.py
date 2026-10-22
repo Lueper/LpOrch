@@ -266,7 +266,10 @@ def CheckJson(relative: str, path: Path) -> tuple[bool, str]:
 
 
 def RunChecks(kind: str, workdir: Path, verifyCommand: str | None) -> tuple[bool, str] | None:
-    """Automated checks for a code/sys workspace: (passed, report), or None when there is nothing to run."""
+    """Automated checks for a code/sys workspace: (passed, report), or None when there is nothing to run.
+
+    phases.RunChecks repeats the "nothing to run" rule (not sys, no verify command) for its start line: keep both in sync.
+    """
     results = SmokeTest(workdir) if kind == "sys" else []
     if verifyCommand:
         results.append(RunStep("verify", verifyCommand, workdir, VERIFY_TIMEOUT))

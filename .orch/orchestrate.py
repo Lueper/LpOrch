@@ -1,7 +1,10 @@
 """Agent orchestrator: every TASKS.md task runs on its own - work -> fresh review -> revision -> result.
 "mode: full" tasks use the multi-agent pipeline (plan -> parallel parts -> ring review -> merge -> integration review).
 Tasks with "after:" wait for those tasks; [sys] tasks change the orchestrator itself and are applied at the end.
-A task whose agents asked for follow-up work gets those tasks appended to the task list as new pending ones.
+A task whose agents asked for follow-up work gets those tasks appended to the task list as new pending ones, tied to
+the task a person wrote that the chain started from ("ref: T01 (origin)") and limited in depth and number per origin.
+What only a person can do becomes a "todo:" line under its task, and the tasks built on it wait until it is done;
+a chain that ended or waits on a person gets a Korean goal report (reporting/goal.py).
 [test] tasks run in a disposable copy of the project and leave only a report; [task] tasks write new tasks.
 When the run ends, every task that ran (sys tasks too) gets a Korean progress report in report/ (reporting/progress.py);
 for every kind but doc, whose result is its document in doc/, the task list's result line then points at that report.
@@ -49,14 +52,16 @@ from core.context import RefLabel, RefTasks, ResolveRefs, ResultFiles, StaleNoti
 from core.paths import PROJECT_ROOT, RUNS_DIR, SKILL_DIR, WORKTREES_DIR
 from core.providers import PROVIDER_SPECS, PROVIDERS
 from core.runcontext import RunContext
-from core.taskfile import DIRECTIVE_PATTERN, TASK_REF_PATTERN, AddDetail, LinkDependencies
+from core.taskfile import DIRECTIVE_PATTERN, TASK_REF_PATTERN, AddDetail, LinkDependencies, RefEntries
 from core.tasks import (
-    MAX_FOLLOWUPS, MAX_PARTS, MODE_FULL, MODE_STANDARD, STATUS_DONE, STATUS_FAILED, STATUS_PENDING, STATUS_RUNNING,
-    FollowUp, FollowUpsOf, Task, TaskFileError, TaskId, TitleKey,
+    MAX_FOLLOWUPS, MAX_PARTS, MODE_FULL, MODE_STANDARD, ORIGIN_MARKER, STATUS_DONE, STATUS_FAILED, STATUS_PENDING,
+    STATUS_RUNNING, FollowUp, FollowUpDepth, FollowUpsOf, Task, TaskFileError, TaskId, TitleKey, TodoBlockers,
+    TodosAsked,
 )
 from core.tasksource import CreateTaskSource, TaskSource
 from pipeline.merge import ApplySystemTasks
 from pipeline.taskflow import RunTask
+from reporting.goal import NOT_ADDED_NOTE, Added, GoalReport, StalledChains, WriteGoalReports
 from reporting.progress import WriteProgressReports
 from reporting.report import WriteRunSummary
 from workspace import gitops
@@ -149,6 +154,9 @@ def PrintPlan(tasks: list[Task], source: TaskSource, config: OrchConfig, paralle
         print(f"tasks: {note}")
     if config.followUps:  # the run may add tasks to the list, so preview says so before it does
         print(f"follow-ups: a succeeded task may add up to {MAX_FOLLOWUPS} follow-up task(s) to {source.label}")
+        depth, total = (limit or "no limit" for limit in (config.maxFollowUpDepth, config.maxFollowUpsPerOrigin))
+        print(f"follow-ups: tied to their origin task (ref: Txx {ORIGIN_MARKER}); depth {depth}, {total} per origin;"
+              " what only a person can do becomes a todo: line that holds back the tasks built on it")
     if any(task.kind == "task" for task in tasks):
         print(f"task tasks: the tasks they write are added to {source.label} when the run ends,"
               f" numbered from {TaskId(source.NextNumber())}")
@@ -168,6 +176,9 @@ def PrintPlan(tasks: list[Task], source: TaskSource, config: OrchConfig, paralle
     if any(task.kind == "code" for task in tasks):
         repo = gitops.ResolveRepo(PROJECT_ROOT)
         print(f"git: {repo[0]} @ {repo[1][:8]}" if repo else "git: NOT a repo with commits - code tasks will fail")
+        if repo:  # what the results are merged into and staged over, one after another
+            print("git: code tasks start from HEAD plus its uncommitted changes to tracked files; their results are"
+                  " merged one after another and staged in the working tree")
     if any(task.kind == "sys" for task in tasks):
         print("sys: edited in sandbox copies; applied to the project when the run ends if checks and reviews pass")
     for task in tasks:
@@ -181,6 +192,10 @@ def PrintPlan(tasks: list[Task], source: TaskSource, config: OrchConfig, paralle
 
 def TaskSettings(task: Task) -> list[tuple[str, str]]:
     settings = []
+    origin = next((up for up in task.upstream if up.id == task.origin), None)
+    if origin:
+        settings.append(("origin", f"{origin.id} {origin.title} (follow-up generation {FollowUpDepth(task)})"))
+    settings += [("todo", item) for item in task.todoOpen] + [("todo done", item) for item in task.todoDone]
     if task.upstream:
         waits = [f"{up.id} ({'this run' if up.status == STATUS_PENDING else StatusName(up.status)})" for up in task.upstream]
         settings.append(("after", ", ".join(waits)))
@@ -239,12 +254,25 @@ def CreateLogger(runDir: Path) -> logging.Logger:
     return logger
 
 
-def CreateContext(config: OrchConfig, parallel: int) -> RunContext:
+def CreateContext(config: OrchConfig, parallel: int, snapshot: bool) -> RunContext:
+    """The run's state. With snapshot (the run has code tasks), code tasks start from HEAD plus the working tree's
+    uncommitted changes, so results a person has not committed yet are their base instead of a conflict."""
     runId = datetime.now().strftime("%Y%m%d-%H%M%S")
     runDir = RUNS_DIR / runId
     runDir.mkdir(parents=True)
     repo = gitops.ResolveRepo(PROJECT_ROOT)
     repoRoot, baseCommit = repo if repo else (None, None)
+    log = CreateLogger(runDir)
+    if repo and snapshot:
+        try:
+            base, uncommitted = gitops.SnapshotCommit(repoRoot)
+        except gitops.GitError as error:  # HEAD alone is the old behavior: uncommitted files then block results
+            log.warning("git: no snapshot of the uncommitted changes, code tasks start from HEAD: %s", error)
+        else:
+            if uncommitted:
+                log.info("git: code tasks start from HEAD %s plus its uncommitted changes (snapshot %s)",
+                         baseCommit[:8], base[:8])
+            baseCommit = base
     return RunContext(
         runId=runId,
         runDir=runDir,
@@ -253,8 +281,9 @@ def CreateContext(config: OrchConfig, parallel: int) -> RunContext:
         worktreeDir=WORKTREES_DIR / runId,
         baseCommit=baseCommit,
         config=config,
-        log=CreateLogger(runDir),
+        log=log,
         semaphore=asyncio.Semaphore(parallel),
+        appliedCommit=baseCommit,
     )
 
 
@@ -322,6 +351,8 @@ def RemoveWorkspaces(tasks: list[Task], ctx: RunContext) -> None:
     for part in (part for task in tasks for part in task.parts):  # branches and stashes survive
         if part.kind == "code" and part.worktree:
             gitops.RemoveWorktree(ctx.repoRoot, part.worktree)
+    if ctx.applyWorktree:  # its branch orch/<run>/applied stays: what the run staged, merge by merge
+        gitops.RemoveWorktree(ctx.repoRoot, ctx.applyWorktree)
     shutil.rmtree(ctx.worktreeDir, ignore_errors=True)  # sys sandboxes and the system snapshot
 
 
@@ -363,7 +394,8 @@ def ResolveOwnIds(line: str, own: dict[str, str | None]) -> tuple[str, str | Non
     """
     directive = DIRECTIVE_PATTERN.match(line)
     key = directive["key"].lower() if directive else ""
-    if not own or not (key == "after" or (key == "ref" and TASK_REF_PATTERN.match(directive["value"].strip()))):
+    entries = RefEntries(directive["value"].strip()) if key == "ref" else []
+    if not own or not (key == "after" or any(TASK_REF_PATTERN.match(entry) for entry in entries)):
         return line, None
     missing: list[str] = []
 
@@ -376,7 +408,10 @@ def ResolveOwnIds(line: str, own: dict[str, str | None]) -> tuple[str, str | Non
             return match[0]
         return own[expected]
 
-    value = OWN_ID_PATTERN.sub(Swap, directive["value"])
+    if key == "ref":  # only the task IDs among the entries: "doc/T05.md" next to them is a path
+        value = ", ".join(OWN_ID_PATTERN.sub(Swap, entry) if TASK_REF_PATTERN.match(entry) else entry for entry in entries)
+    else:
+        value = OWN_ID_PATTERN.sub(Swap, directive["value"])
     if missing:
         return line, f"points at {', '.join(missing)} of the same list, which is not in the task list before it"
     return line[:directive.start("value")] + value, None
@@ -452,19 +487,28 @@ def AddWrittenTasks(
 
 
 def AddFollowUpTasks(
-    tasks: list[Task], known: dict[tuple[str, str], str], knownIds: set[str], log: logging.Logger,
-    source: TaskSource, projectDir: Path,
-) -> None:
-    """Append the follow-up tasks this run's agents asked for to the task list, as new pending tasks.
+    tasks: list[Task], allTasks: list[Task], known: dict[tuple[str, str], str], knownIds: set[str],
+    log: logging.Logger, source: TaskSource, config: OrchConfig, projectDir: Path,
+) -> list[Added]:
+    """Append the follow-up tasks this run's agents asked for to the task list, as new pending tasks; returns them.
 
     Only tasks that succeeded contribute: a failed or blocked task goes back to pending and runs again, which
     would propose the same follow-ups a second time. A title already in the task list is skipped for the same
     reason, so re-running a task does not pile up duplicates.
+    Each follow-up is tied to its chain: "ref: <origin> (origin)" names the task a person wrote that the chain started
+    from - its goal and result are the follow-up's base - and "after: <task>" the task that proposed it. A chain grows
+    at most max_followup_depth generations and max_followups_per_origin follow-ups; what a limit stops is noted on
+    the proposing task (and in the goal report) instead of being added.
     """
+    perOrigin: dict[str, int] = {}
+    for task in allTasks:
+        if task.origin:
+            perOrigin[task.origin] = perOrigin.get(task.origin, 0) + 1
+    addedAll: list[Added] = []
     for task in tasks:
         if not task.ok or task.blocked:
             continue
-        # Duplicates are dropped before the cap, so repeats of known titles cannot crowd out a new proposal
+        # Duplicates are dropped before the caps, so repeats of known titles cannot crowd out a new proposal
         proposed = FollowUpsOf(task)
         wanted = [followUp for followUp in proposed if followUp.key not in known]
         for followUp in (item for item in proposed if item.key in known):
@@ -472,28 +516,75 @@ def AddFollowUpTasks(
         if len(wanted) > MAX_FOLLOWUPS:
             log.warning("[%s] %d follow-up tasks asked for; only the first %d are added", task.id, len(wanted), MAX_FOLLOWUPS)
             wanted = wanted[:MAX_FOLLOWUPS]
+        origin = task.origin or task.id
+        depth = FollowUpDepth(task) + 1
+        if wanted and config.maxFollowUpDepth and depth > config.maxFollowUpDepth:
+            NotAdded(task, wanted, f"generation {depth} of origin {origin} is past max_followup_depth"
+                     f" {config.maxFollowUpDepth}", log)
+            continue
+        room = config.maxFollowUpsPerOrigin - perOrigin.get(origin, 0) if config.maxFollowUpsPerOrigin else len(wanted)
+        if len(wanted) > max(room, 0):
+            NotAdded(task, wanted[max(room, 0):], f"origin {origin} has {perOrigin.get(origin, 0)} follow-ups,"
+                     f" max_followups_per_origin {config.maxFollowUpsPerOrigin}", log)
+            wanted = wanted[:max(room, 0)]
+        chain = [f"ref: {origin} {ORIGIN_MARKER}"] + ([f"after: {task.id}"] if task.id != origin else [])
+        for item in wanted:
+            item.details = [*chain, *item.details]
         added = AddTasks(task, wanted, known, knownIds, source, projectDir, log, "follow-up task")
+        perOrigin[origin] = perOrigin.get(origin, 0) + len(added)
+        addedAll += [(taskId, item, task) for taskId, item in added]
         if added:  # summary.md and the progress report say what the next run will pick up
             task.notes.append(f"follow-up task(s) added to the task list: {AddedLabels(added)}")
+    return addedAll
+
+
+def NotAdded(task: Task, items: list[FollowUp], reason: str, log: logging.Logger) -> None:
+    """Note follow-ups a chain limit kept out of the task list: the progress and goal reports show them to a person."""
+    labels = "; ".join(f"[{item.kind}] {item.title}" for item in items)
+    log.warning("[%s] follow-up task(s) not added (%s): %s", task.id, reason, labels)
+    task.notes.append(f"{NOT_ADDED_NOTE} ({reason}): {labels}")
+
+
+def WriteTodos(tasks: list[Task], log: logging.Logger, source: TaskSource) -> None:
+    """Write the to-dos for a person this run found under their tasks, as "todo:" lines in the task list.
+
+    Only tasks that succeeded: a failed or blocked one runs again and finds them anew. Every task built on a task
+    with an open to-do waits until a person deletes the line or marks it "todo: [x] ..." (TodoBlockers).
+    """
+    for task in tasks:
+        todos = TodosAsked(task) if task.ok and not task.blocked else []
+        if not todos:
+            continue
+        try:
+            source.AddTodos(task, todos)
+        except (TaskFileError, OSError) as error:  # never let bookkeeping hide the run's results
+            log.warning("[%s] to-do(s) for a person not written to the task list: %s", task.id, error)
+            task.notes.append(f"to-do(s) for a person, NOT written to the task list: {'; '.join(todos)}")
+            continue
+        task.todoOpen += todos
+        log.info("[%s] to-do(s) for a person written under the task: %s", task.id, "; ".join(todos))
+        task.notes.append(f"to-do(s) for a person written under the task as todo: lines: {'; '.join(todos)}")
 
 
 def AddNewTasks(
     tasks: list[Task], allTasks: list[Task], log: logging.Logger, source: TaskSource, projectDir: Path,
-    followUps: bool, firstNumber: int,
-) -> None:
+    config: OrchConfig, firstNumber: int,
+) -> list[Added]:
     """Add what this run wrote to the task list: the [task] tasks' lists first - their workers numbered them from
-    firstNumber - then the follow-ups, when [tasks] follow_ups is on. A title is added once, whoever wrote it."""
+    firstNumber - then the follow-ups, when [tasks] follow_ups is on, and last the to-dos for a person under their
+    tasks. A title is added once, whoever wrote it. Returns the follow-ups added."""
     known = {TitleKey(task.kind, task.title): task.id for task in allTasks}
     knownIds = {task.id for task in allTasks}  # what an "after:" or "ref: Txx" may point at
     AddWrittenTasks(tasks, known, knownIds, log, source, projectDir, firstNumber)
-    if followUps:
-        AddFollowUpTasks(tasks, known, knownIds, log, source, projectDir)
+    added = AddFollowUpTasks(tasks, allTasks, known, knownIds, log, source, config, projectDir) if config.followUps else []
+    WriteTodos(tasks, log, source)
+    return added
 
 
 async def RunPipeline(
     tasks: list[Task], allTasks: list[Task], source: TaskSource, config: OrchConfig, parallel: int, reason: str
 ) -> int:
-    ctx = CreateContext(config, parallel)
+    ctx = CreateContext(config, parallel, snapshot=any(task.kind == "code" for task in tasks))
     ctx.nextTaskNumber = source.NextNumber()  # [task] workers number the tasks they write from here
     ctx.log.info("%d task(s), up to %d concurrent agent(s) (%s)", len(tasks), parallel, reason)
     for line in AgentSummary(config):  # run.log records which provider/model each role ran on
@@ -504,6 +595,7 @@ async def RunPipeline(
     if any(task.kind == "sys" for task in tasks):
         ctx.systemBase = CreateSnapshot(PROJECT_ROOT, ctx.worktreeDir / "_base")
     completed = False
+    goals: list[GoalReport] = []
     try:
         # Successful sys tasks are marked only once applied and [task] tasks once their tasks are added,
         # after every other task is done
@@ -514,8 +606,8 @@ async def RunPipeline(
         completed = True
         # After the [sys] applies, so an applied TASKS.md never conflicts with the new lines; in a thread because a
         # Notion row is created over the network, and the reports run right after
-        await asyncio.to_thread(
-            AddNewTasks, tasks, allTasks, ctx.log, source, ctx.projectDir, config.followUps, ctx.nextTaskNumber
+        added = await asyncio.to_thread(
+            AddNewTasks, tasks, allTasks, ctx.log, source, ctx.projectDir, config, ctx.nextTaskNumber
         )
         written = [task for task in tasks if task.kind == "task" and task.status == STATUS_RUNNING]
         MarkTasks(written, FinalStatus, ctx.log, source)
@@ -525,12 +617,14 @@ async def RunPipeline(
         for task in tasks:
             if task.kind != "doc" and task.ok and task.reportRef:
                 task.resultRef = task.reportRef
+        if config.goalReports:  # after the progress reports: a goal report quotes them
+            goals = await WriteGoalReports(StalledChains(tasks, allTasks, added), ctx)
     finally:
         RemoveWorkspaces(tasks, ctx)
         # Aborted runs (and sys tasks never applied) go back to pending so the next run picks them up again
         MarkTasks([task for task in tasks if task.status == STATUS_RUNNING], lambda task: STATUS_PENDING, ctx.log, source)
         RecordResults(tasks, ctx.log, source)
-        print(WriteRunSummary(tasks, ctx, completed))
+        print(WriteRunSummary(tasks, ctx, completed, goals))
     return 0 if all(task.ok for task in tasks) else 1
 
 
@@ -569,6 +663,16 @@ def Main(argv: list[str] | None = None) -> int:
         print(f"notice: {notice}")
     if not pending:
         print(f"No pending tasks in {source.label}")
+        return 0
+    # A "todo:" left for a person holds back its task and every task built on it: they do not start at all
+    waiting = {task.id: blockers for task in pending if (blockers := TodoBlockers(task))}
+    for task in (task for task in pending if task.id in waiting):
+        more = f" (+{len(waiting[task.id]) - 1} more)" if len(waiting[task.id]) > 1 else ""
+        print(f"waiting: {task.id} [{task.kind}] {task.title} - a person's to-do first: {waiting[task.id][0]}{more}")
+    pending = [task for task in pending if task.id not in waiting]
+    if not pending:
+        print(f"No runnable tasks in {source.label}: {len(waiting)} pending task(s) wait for a person's to-do"
+              " (delete the todo: line or mark it todo: [x] ... once done)")
         return 0
     # A watch run with only blocked tasks would just leave an empty run in .orch/runs every interval
     if args.watch_cycle and not any(Runnable(task) for task in pending):

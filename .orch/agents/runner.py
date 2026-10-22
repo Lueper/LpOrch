@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import re
+import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import ModuleType
@@ -90,8 +91,8 @@ class TokenUsage:
         )
 
     def Summary(self) -> str:
-        """"40 turns, peak context 103k, cache read 2.0M, cache write 103k, input 1k, output 40k, time 6m12s,
-        API 5m40s, model claude-opus-5-5" for run.log."""
+        """"40 turns, peak context 103456, cache read 2012345, cache write 103456, input 1234, output 40000, time 6m12s,
+        API 5m40s, model claude-opus-5-5" for run.log: exact token counts, for benchmarks."""
         parts = [f"{self.turns} turns"] if self.turns else []
         if self.peakContext:
             parts.append(f"peak context {TokenCount(self.peakContext)}")
@@ -109,7 +110,7 @@ class TokenUsage:
 
 
 def TokenCount(count: int) -> str:
-    return f"{count / 1_000_000:.1f}M" if count >= 1_000_000 else f"{round(count / 1000)}k"
+    return str(count)  # the raw integer: rounded to k/M, runs could not be compared token by token
 
 
 def Duration(milliseconds: int) -> str:
@@ -156,8 +157,10 @@ async def RunAgent(label: str, prompt: str, spec: AgentSpec, ctx: RunContext) ->
 
 async def RunOnce(label: str, prompt: str, spec: AgentSpec, ctx: RunContext, choice: AgentChoice,
                   backend: ModuleType) -> AgentResult:
+    queuedAt = time.monotonic()
     async with ctx.semaphore:  # one global cap on concurrent agents across all phases
-        ctx.log.info("[%s] start (%s on %s)", label, spec.role, choice.provider)
+        waited = time.monotonic() - queuedAt  # time spent waiting for a free agent slot
+        ctx.log.info("[%s] start (%s on %s; waited %.1fs for a slot)", label, spec.role, choice.provider, waited)
         result = await backend.Run(label, prompt, spec, ctx, choice.model)
         status = "ok" if result.ok else f"failed - {result.error}"
         usage = f"; {result.tokens.Summary()}" if result.tokens else ""  # where the cost came from

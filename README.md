@@ -19,7 +19,9 @@ flowchart LR
 - **교차 리뷰** — 작업을 수행한 에이전트 대신 새 에이전트가 리뷰를 담당해 CRITICAL/WARNING을 판정하고 필요한 수정은 원 작업자가 이어서(resume) 반영함. 단, 작업 세션의 context가 60k token을 넘었고 CRITICAL이 없으면 새 세션이 작업 요약·diff 위치만 받아 수정함. 긴 세션은 요청마다 context 전체를 다시 읽어 비용이 큼 (`phases.FRESH_FIX_CONTEXT_TOKENS`)
 - **5가지 작업 종류** — `doc`(문서), `code`(격리된 git worktree 코드 변경), `sys`(오케스트레이터 자신의 변경, 샌드박스 사본 + 자동 체크 통과 시에만 반영), `test`(프로젝트 임시 복사본에서 시험), `task`(다음 작업 작성)
 - **작업 목록 소스 선택** — 작업을 `TASKS.md`에 적거나 Notion 데이터베이스의 행으로 관리함 (`[tasks] source`). Notion을 쓰면 `TASKS.md`는 그 캐시가 됨
-- **후속 작업 자동 추가** — 작업 중 별도 Task가 필요한 일을 발견하면 에이전트가 요청하고, 성공한 Task에 한해 오케스트레이터가 작업 목록 끝에 pending으로 추가함 (`[tasks] follow_ups`, Task당 최대 5개)
+- **후속 작업 자동 추가** — 작업 중 별도 Task가 필요한 일을 발견하면 에이전트가 요청하고, 성공한 Task에 한해 오케스트레이터가 작업 목록 끝에 pending으로 추가함 (`[tasks] follow_ups`, Task당 최대 5개). 후속 작업은 사람이 쓴 원래 Task(origin)에 `ref: Txx (origin)`으로 묶이고, 깊이·개수 상한이 있음
+- **사람 조치 추적** — merge·commit·결정처럼 사람만 할 수 있는 일은 Task가 아니라 해당 Task의 `todo:` 줄로 기록되고, 그 Task를 기반으로 하는 작업은 처리될 때까지 대기함
+- **목표 종합 보고** — origin의 후속 작업 체인이 끝나거나 사람 조치 대기로 멈추면 목표 대비 결과·남은 일·사람 조치를 묶은 보고서를 자동 생성함
 - **대규모 작업 분할** — `mode: full` 지정 시 Planner가 작업을 1~4개 Part로 나눠 동시 처리 후 Ring Review와 Merge를 거침
 - **안전장치** — 위험 Bash 명령 차단 훅(`protect-files.sh`), `.env`/secret 파일 수정 차단, destructive git 명령 deny 목록 등을 기본 내장
 
@@ -88,10 +90,10 @@ python3 -m venv .venv
 
    - 간격은 run **시작** 기준. run이 간격보다 오래 걸리면 끝나자마자 다음 run 시작 (겹쳐 돌지 않음)
    - 매 run은 새 프로세스로 실행됨 → 작업 목록·`orch.toml`·`[sys]` 작업이 바꾼 코드가 다음 run에 반영됨
-   - pending 작업이 없거나 전부 `after:` 선행 실패로 blocked면 run을 만들지 않고 다음 주기까지 대기함
+   - pending 작업이 없거나 전부 `after:` 선행 실패로 blocked이거나 사람의 `todo:`를 기다리면 run을 만들지 않고 다음 주기까지 대기함
    - 설정·작업 목록 오류(`error: ...`)가 나도 멈추지 않고 다음 주기에 다시 확인함 (시작 시점의 `orch.toml` 오류만 즉시 종료)
    - run 도중 Ctrl+C → 해당 run이 작업을 pending으로 되돌린 뒤 종료됨
-   - 후속 작업(follow-up)·`[task]` 작업이 추가한 Task도 다음 주기에 실행됨 → 연쇄 실행 비용이 걱정되면 `[tasks] follow_ups = false`
+   - 후속 작업(follow-up)·`[task]` 작업이 추가한 Task도 다음 주기에 실행됨 → 후속 작업 체인은 `max_followup_depth`·`max_followups_per_origin`에서 멈춤. 아예 끄려면 `[tasks] follow_ups = false`
 
 4. 결과 확인 — `doc/[Txx]_<날짜>_<제목>.md`, `git diff --cached`(code), `report/[Txx]_<날짜>_<제목>.md`(Task별 진행 보고), `.orch/runs/<run-id>/summary.md`
 
@@ -126,6 +128,9 @@ python3 -m venv .venv
 | `[agent]` | `provider` | `"claude"` | `--provider` | 역할별 지정이 없는 모든 역할의 provider (`claude` \| `gemini`) |
 | `[tasks]` | `source` | `"file"` | `--source` | 작업 목록 위치 (`file` = `TASKS.md`, `notion` = `[notion]`의 데이터베이스) |
 | | `follow_ups` | `true` | — | 성공한 Task가 에이전트들이 요청한 후속 작업을 목록에 추가함(Task당 최대 5개). `false` = 에이전트에게 요청 자체를 안 하고 목록에 아무것도 쓰지 않음 |
+| | `max_followup_depth` | `2` | — | 사람이 쓴 Task(origin)에서 자라날 수 있는 후속 작업 세대 수. 초과분은 추가하지 않고 진행·목표 보고에 기록함. `0` = 제한 없음 |
+| | `max_followups_per_origin` | `10` | — | origin 하나에 누적될 수 있는 후속 작업 총수. `0` = 제한 없음 |
+| | `goal_reports` | `true` | — | origin의 후속 작업 체인이 끝나거나 사람의 `todo:`를 기다리며 멈추면 목표 종합 보고(`report/[Txx]_<YYMMDD>_목표_보고_<제목>.md`)를 생성함 |
 | `[notion]` | `database` | `""` | — | 데이터베이스 링크("Copy link") 또는 32자 id (`?v=` 뷰 id는 무시됨). `source = "notion"`일 때 필수 |
 | | `token_env` | `"NOTION_TOKEN"` | — | integration token이 담긴 환경변수 **이름** (토큰 자체는 `orch.toml`에 적지 않음) |
 | `[claude]` | `model` | `""` | `--model` | 주 모델, `""` = CLI 기본 모델 |
@@ -158,7 +163,8 @@ claude와 gemini는 interface가 같은 backend로 대칭 구성됨.
   - 실패한 세션이 저장돼 있으면 그 세션을 이어서 답만 다시 요청함 → 이미 끝낸 검색·편집은 유지됨. 세션이 없으면 같은 호출을 처음부터 다시 실행함
   - 인증·예산·turn 상한·rate limit(429) 실패는 다시 해도 같으므로 재시도 안 함. 판정 기준은 backend별 `TRANSIENT_ERROR`
   - run.log에는 `<단계> retry1`로 기록되고 실패한 시도의 비용도 합산됨
-- **token 기록**: Claude 호출은 종료 줄에 비용과 함께 token 사용량이 남음. 예: `ok ($2.572; 31 turns, peak context 103k, cache read 2.0M, cache write 103k, input 1k, output 40k, time 6m12s, API 5m40s, model claude-opus-5-5)`. `peak context`(가장 큰 요청)와 `cache read`가 크면 세션이 길게 늘어진 것임 (Gemini는 별도 `tokens:` 줄)
+- **token 기록**: Claude 호출은 종료 줄에 비용과 함께 token 사용량이 남음. 예: `ok ($2.572; 31 turns, peak context 103456, cache read 2012345, cache write 103456, input 1234, output 40000, time 6m12s, API 5m40s, model claude-opus-5-5)`. 벤치마크 비교를 위해 token은 반올림 없는 정수 원값으로 기록함. `peak context`(가장 큰 요청)와 `cache read`가 크면 세션이 길게 늘어진 것임 (Gemini는 별도 `tokens:` 줄)
+  - 비용·`API` 시간은 그 호출의 몫임. resume·fork한 session은 CLI가 session 누적값을 보고하므로, 같은 session이 직전에 보고한 값을 빼서 기록함 (수정·재시도 호출이 앞선 호출 비용을 다시 더하지 않음)
   - token 합계는 result message의 usage 합계와 응답별 usage 합계 중 항목마다 큰 값임 (응답별 usage는 스트리밍 중간 값이라 output이 빠질 수 있음)
   - `time`·`API`는 result message의 `duration_ms`·`duration_api_ms`, `model`은 `model_usage`의 model ID(subagent 포함, `+`로 연결)
 - **context 절약**: worker는 파일 전체 `cat` 대신 Grep + 필요한 범위만 Read하고 관련 수정은 한 번에 Edit하도록 지시받음 (`prompts/worker.md` "Working Economically"). reviewer 입력의 diff는 30k자까지만 넣고, 넘으면 변경 파일 목록 + 앞부분 + 나머지 파일 위치를 줌 (`review.REVIEW_DIFF_CHARS`)
@@ -213,7 +219,7 @@ claude와 gemini는 interface가 같은 backend로 대칭 구성됨.
 | kind | 설명 | 결과물 위치 |
 |---|---|---|
 | `doc` | 리서치/작성/분석 → Markdown 산출물 | `doc/[Txx]_<YYMMDD>_<제목>.md` |
-| `code` | 격리된 git worktree에서 하는 코드 변경 | 워킹 트리에 staged 상태로 반영 (`git diff --cached`) |
+| `code` | 격리된 git worktree에서 하는 코드 변경. HEAD + 미커밋 변경(snapshot)에서 시작하고, 같은 run에서 먼저 반영된 code 결과 위에서 시작함 | 워킹 트리에 staged 상태로 반영 (`git diff --cached`). 같은 run의 결과는 통합 branch(`orch/<run-id>/applied`)에 차례로 3-way merge된 뒤 반영됨 |
 | `sys` | 오케스트레이터 자신(`.orch/`, `.claude/`, `CLAUDE.md`, `README.md`, `TASKS.md`, `orch.toml`, `orch*.bat`, `orch*.sh`)의 변경 | 자동 체크·리뷰 통과 시 실제 파일에 적용, 원본은 `.orch/runs/<run-id>/<Txx>/backup/`에 백업 |
 | `test` | 프로젝트 전체의 임시 복사본(미커밋 변경 포함, `.git`·run 기록 제외)에서 파일 수정·명령 실행으로 시험 | 진행 보고만 남음 (복사본은 run 종료 시 삭제, 실제 프로젝트는 변경 없음) |
 | `task` | 다음 작업 작성 — 결과물이 작업 목록 문법의 새 task 목록이며 다른 결과물처럼 리뷰됨 (최대 20개) | run 종료 시 작업 목록 끝에 pending으로 추가, 다음 run에서 실행. 새 ID는 다음 빈 번호부터 매겨지고 agent에게 미리 알려줘서 `after:`로 서로 연결 가능 |
@@ -230,12 +236,16 @@ claude와 gemini는 interface가 같은 backend로 대칭 구성됨.
   lang: en
   verify: pytest -q
   mode: full
+  todo: 결정 필요 — API v2 유지 여부
 ```
 
 | directive | 의미 |
 |---|---|
-| `after: Txx, Tyy` | 지정한 작업들이 끝날 때까지 대기 후 그 결과를 입력으로 사용 |
-| `ref: <path\|URL>` | 작업의 근거 자료(파일/폴더/glob/URL). 작은 텍스트 파일은 프롬프트에 직접 삽입되고 리뷰어가 대조 검증함. 경로 구분자는 OS와 무관하게 `/`, `\` 모두 가능 |
+| `after: Txx, Tyy` | 지정한 작업들이 끝날 때까지 대기 후 그 결과를 입력으로 사용. 지정한 작업에 처리되지 않은 `todo:`가 있으면 그것이 끝날 때까지 대기 |
+| `ref: <path\|URL>` | 작업의 근거 자료(파일/폴더/glob/URL). 작은 텍스트 파일은 프롬프트에 직접 삽입되고 리뷰어가 대조 검증함. 경로 구분자는 OS와 무관하게 `/`, `\` 모두 가능. 여러 개는 줄을 나눠 적음 |
+| `ref: Txx` | 그 작업의 결과물과 리뷰 이력을 근거 자료로 씀(같은 run이면 대기). 작업 ID는 한 줄에 여러 개 적을 수 있고 경로와 섞어도 됨: `ref: T01, T02`, `ref: T01 T02`, `ref: T01, doc/x.md` |
+| `ref: Txx (origin)` | 후속 작업이 섬기는 목표 — 체인이 시작된, 사람이 쓴 Task. 오케스트레이터가 후속 작업마다 자동 기록하며 `ref: Txx`처럼 그 결과를 근거 자료로 씀 |
+| `todo: <할 일>` | 사람만 할 수 있는 조치(merge·commit·결정 등). 이 줄이 남아 있는 동안 이 Task와 이를 기반으로 하는 Task는 실행되지 않음. 처리 후 줄을 지우거나 `todo: [x] <할 일>`로 표시함(완료 기록은 이후 작업의 참고 정보로 전달됨). 에이전트 제안이나 오케스트레이터(반영 실패한 code 결과)가 자동 기록함 |
 | `lang: en` | doc 산출물 출력 언어 지정 (기본값: 한국어) |
 | `verify: <command>` | code/sys 작업에서 반드시 통과해야 하는 쉘 커맨드. Windows는 `cmd.exe`, macOS/Linux는 `/bin/sh`에서 실행됨 |
 | `mode: full` | 대규모 작업을 1~4개 에이전트로 분할하는 멀티 에이전트 파이프라인 사용 (기본값: standard, 1에이전트+1리뷰) |
@@ -247,7 +257,20 @@ claude와 gemini는 interface가 같은 backend로 대칭 구성됨.
 
 - **설정** — `[tasks] follow_ups`(기본 `true`). `false`면 에이전트 프롬프트에 요청 자체가 들어가지 않으므로 아무것도 추가되지 않음. `orch preview`가 켜져 있는지와 상한을 미리 알려줌
 - **상한** — 한 Task가 추가할 수 있는 후속 작업은 최대 5개(`MAX_FOLLOWUPS`). 그보다 많이 요청하면 앞의 5개만 추가되고 run.log에 WARNING이 남음
-- **리뷰 대상** — 제안된 후속 작업은 결과물과 함께 리뷰어에게 전달됨. 리뷰어는 이를 결과물의 품질로 판정하지 않되, 이 Task가 끝냈어야 할 일을 떠넘기거나 결과물과 중복되거나 작성자의 세션 없이는 실행 불가능할 만큼 모호하면 WARNING으로 지적함. 작성자는 수정 때 문구를 고치거나 뺄 수 있음
+- **origin 연결** — 사람이 쓴 Task가 체인의 origin이 됨. 오케스트레이터가 후속 작업마다 `ref: <origin> (origin)`과 `after: <제안한 Task>`를 자동 기록함
+  - 후속 작업은 origin의 결과물·목표와 제안한 Task의 결과·리뷰 이력을 근거로 받음
+  - 에이전트는 "origin 목표를 전진시키는 일만 후속 작업으로 제안하라(도구 정비·재검증 제외)"는 지시를 받음
+- **체인 상한** — origin에서 자라는 세대 수(`max_followup_depth`, 기본 2)와 origin당 총수(`max_followups_per_origin`, 기본 10)를 넘는 제안은 추가되지 않음. 대신 제안한 Task의 진행 보고와 목표 종합 보고에 "추가 안 됨"으로 남아 사람이 판단함
+- **사람 조치(`todo:`)** — merge·commit·결정·외부 조치처럼 사람만 할 수 있는 일은 Task로 제안하지 않음. 에이전트가 같은 블록에 `- [todo] <할 일>`로 적으면 오케스트레이터가 그 Task 아래 `todo:` 줄로 기록함 (Notion은 `details` 속성)
+  - 반영에 실패한 code 결과도 적용 방법(patch 경로 포함)이 `todo:`로 기록됨
+  - 처리되지 않은 `todo:`가 있는 Task를 기반(`after:`/`ref:`)으로 하는 작업은 실행되지 않고 `waiting:`으로 표시됨
+  - 처리 후 줄을 지우거나 `todo: [x] ...`로 표시하면 다음 run부터 진행됨
+- **목표 종합 보고** — origin의 체인이 끝나거나(실행할 수 있는 작업이 없음) 사람의 `todo:`를 기다리며 멈추면 `report/[Txx]_<YYMMDD>_목표_보고_<제목>.md`가 생성됨 (`[tasks] goal_reports`). 목표 대비 달성 여부, 체인 표, 사람 조치, 남은 작업, 다음 단계를 한국어로 정리함
+- **리뷰 대상** — 제안된 후속 작업과 `[todo]`는 결과물과 함께 리뷰어에게 전달됨. 리뷰어는 이를 결과물의 품질로 판정하지 않음. 다만 다음 경우 WARNING으로 지적하고, 작성자는 수정 때 문구를 고치거나 뺄 수 있음
+  - 이 Task가 끝냈어야 할 일을 떠넘김, 결과물과 중복, 작성자 세션 없이는 실행 불가능할 만큼 모호함
+  - origin 목표를 전진시키지 않음 (도구 정비·재검증만 함)
+  - 사람만 할 수 있는 일을 Task로 만듦
+  - 꼭 필요하지 않은 `[todo]`
 - **추가 규칙**
   - 이미 목록에 같은 제목(kind + 제목)이 있으면 추가하지 않음
   - 다음 run을 중단시킬 detail 줄은 버리고 run.log에 기록함. 존재하지 않는 `after:` ID, 아무것도 매칭하지 않는 `ref:`, 알 수 없는 `mode:`가 이에 해당함
@@ -288,8 +311,8 @@ claude와 gemini는 interface가 같은 backend로 대칭 구성됨.
 | `title` | Text | 작업 제목 |
 | `kind` | Select | `doc` \| `code` \| `sys` \| `test` \| `task` (역할 스킬은 `code:refactorer`처럼) |
 | `status` | Status | `pending` / `running` / `done` / `failed` 옵션 필요 → `[ ]` `[~]` `[x]` `[!]`에 대응 |
-| `ref` | Text | 근거 자료, 한 줄에 하나 (경로/glob/URL/작업 ID) — 각 줄이 `ref:` directive가 됨 |
-| `details` | Text | 그 외 detail 줄, 한 줄에 하나 (`after: T01`, `lang: en`, `verify: ...`, `mode: full`, 일반 지시문) |
+| `ref` | Text | 근거 자료, 한 줄에 하나 (경로/glob/URL/작업 ID) — 각 줄이 `ref:` directive가 됨. 작업 ID는 한 줄에 여러 개 가능(`T01, T02`). 후속 작업 행에는 `T01 (origin)`이 자동 기록됨 |
+| `details` | Text | 그 외 detail 줄, 한 줄에 하나 (`after: T01`, `lang: en`, `verify: ...`, `mode: full`, 일반 지시문). 사람 조치 `todo: ...` 줄이 run 종료 시 추가될 수 있음 (처리 후 삭제 또는 `todo: [x] ...`) |
 | `result` | Text | 오케스트레이터가 성공 시 기록 — `doc/x.md (run 20261008-101500)` (doc 외 kind는 `report/` 진행 보고 경로) |
 
 - API로는 Status 옵션을 만들 수 없으므로 네 옵션은 미리 만들어 둬야 함
@@ -300,7 +323,7 @@ claude와 gemini는 interface가 같은 backend로 대칭 구성됨.
 - **ID 순서** — 행은 작업 ID 순으로 읽힘. 같은 ID가 둘이면 먼저 만들어진 행이 ID를 가져가고 나머지는 경고로 빠짐. ID가 없거나 제목·kind·status가 비정상인 행은 읽히지 않은 줄처럼 경고로 보고됨 (Notion 데이터베이스 끝의 빈 행은 조용히 무시)
 - **행 수 상한** — 앞 500행까지만 읽고, 초과하면 경고가 표시됨
 - **`TASKS.md`는 캐시** — 모든 run·preview가 `TASKS.md`의 작업 목록 부분을 행 내용으로 덮어씀(상단 주석 헤더는 유지). 이후 run은 그 파일을 평소처럼 읽고 씀. **작업은 Notion에서 편집해야 하며, 캐시된 줄을 고쳐도 다음 run이 덮어씀**
-- **쓰기 경로** — 상태 마커, `result`, 후속/`task` 작업 추가는 **행에 먼저** 쓰고 그다음 파일에 반영함. 각각 동기 API 호출 1회이며, 상태·결과가 바뀔 때와 작업이 추가될 때만 호출함. 실패한 호출은 429·5xx와 네트워크 오류(timeout·깨진 응답 포함)를 최대 3회 시도한 뒤 포기하고 run.log에 남음. 결과물 자체는 영향받지 않음
+- **쓰기 경로** — 상태 마커, `result`, 후속/`task` 작업 추가, `todo:` 추가(`details` 속성 전체를 다시 씀)는 **행에 먼저** 쓰고 그다음 파일에 반영함. 각각 동기 API 호출 1회이며, 상태·결과가 바뀔 때와 작업이 추가될 때만 호출함. 실패한 호출은 429·5xx와 네트워크 오류(timeout·깨진 응답 포함)를 최대 3회 시도한 뒤 포기하고 run.log에 남음. 결과물 자체는 영향받지 않음
 - **후속 작업** — 새 행이 다음 빈 ID로 생성되므로 기존 ID는 움직이지 않음. 새 행의 Notion 페이지 URL은 `run.log`에 기록됨 (`summary.md`·진행 보고에는 ID와 제목만)
 - **파일로 일회성 실행** — `orch --source file`은 Notion을 건드리지 않고 `TASKS.md`를 그대로 실행함 (이때 ID는 다시 줄 순서를 따름). sys 작업의 자동 체크도 이 방식으로 돌아 네트워크를 타지 않음
 - **`orch-reset`** — 로컬 파일만 지움. Notion 행은 상태·결과를 그대로 유지하고 다음 run·preview에 `TASKS.md`로 다시 들어오므로, 정말 지우려면 Notion에서 지워야 함. reset이 이 사실을 안내 문구로 알려줌
@@ -314,10 +337,15 @@ claude와 gemini는 interface가 같은 backend로 대칭 구성됨.
 
 - `doc` → `doc/[Txx]_<YYMMDD>_<제목>.md` (1작업당 1문서). 문서에는 본문만 들어가고, 작성자의 가정 사항·병합 메모·미해결 리뷰 지적은 진행 보고로 감
 - `code` → 워킹 트리에 staged 변경 (`git diff --cached`로 리뷰)
+  - 이전 run에서 staged만 하고 commit하지 않은 결과도 다음 run의 base에 포함되므로 반영을 막지 않음
+  - 같은 run의 결과끼리 같은 파일을 고쳐도 통합 branch에서 3-way merge됨. 충돌은 code-merger 에이전트가 해결하고, `verify:`가 있으면 다시 통과해야 함
+  - 반영되지 않는 경우는 run 도중 사람이 같은 파일을 고쳤거나 merge 충돌이 해결되지 않았을 때뿐임. 이때 patch가 `.orch/runs/<run-id>/<Txx>/apply.patch`에 남고, 적용 방법이 그 Task의 `todo:`로 기록됨
 - `sys` → 시스템 파일에 직접 적용, 원본 백업은 `.orch/runs/<run-id>/<Txx>/backup/`, 전체 diff는 `sys.diff`
 - `test` → 진행 보고만 남음 (테스트 결과·복사본에서 바꾼 파일 목록 포함)
 - `task` → 작업 목록에 새 pending task 추가 (추가된 ID는 진행 보고와 `summary.md`에 기록)
 - 후속 작업 → 성공한 Task가 요청한 만큼 작업 목록 끝에 pending으로 추가됨 (`TASKS.md`의 줄 또는 새 Notion 행). 추가된 ID·제목은 진행 보고의 "남은 이슈 및 후속 조치"와 `summary.md`에 기록됨
+- 사람 조치 → 해당 Task 아래 `todo:` 줄 (Notion `details`). `summary.md`의 "To-dos for a person"과 진행 보고에도 표시됨
+- 목표 종합 보고 → origin 체인이 끝나거나 사람 조치 대기로 멈추면 `report/[Txx]_<YYMMDD>_목표_보고_<제목>.md` (`summary.md`의 "Goal reports"에 경로·비용 기록)
 - 진행 보고 → 실행된 Task마다 `report/[Txx]_<YYMMDD>_<제목>.md` 생성 (code·doc·sys 모두). sys는 적용 여부와 원본 백업 위치를 포함함. run 종료 시 `small_model`(기본 haiku)이 run 기록(`run.log`, `notes`/`review`/`response`/`checks`, 변경 파일 또는 문서 목차)을 읽고 개요·진행 경과·작업 내용·가정 사항·리뷰 지적사항 및 처리 결과·후속 조치를 한국어로 정리함. 요약 실패 시 원자료를 그대로 기록함. `after:` 선행 실패로 blocked된 Task는 제외됨. `doc` 외 kind는 이 보고서가 결과 문서가 되어 작업 목록의 결과 줄(`→ result:`, Notion `result`)이 이를 가리킴
 - 로그/리뷰/요약 → `.orch/runs/<run-id>/summary.md`에서 작업별 상태·파트 수·리뷰 결과·비용 확인 가능
 

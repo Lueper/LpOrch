@@ -1,7 +1,8 @@
-"""Turn a run's run.log into one CSV row per agent call, and check the per-task totals against its summary.md.
+"""Turn a run's run.log into one CSV row per agent call, and check the per-task totals and times against its summary.md.
 
 Usage (from the project root):
-    python .orch/benchmark.py                 the latest run in .orch/runs/
+    python .orch/benchmark.py                 the latest finished run (with a summary.md) in .orch/runs/
+                                              (the latest run.log when none finished; exit 0 when there is no run)
     python .orch/benchmark.py 20261022-120345 that run (a run ID, or the path of a run folder)
     python .orch/benchmark.py RUN -o out.csv  write the CSV there instead of <run folder>/calls.csv
 Each call is a "[label] start (role on provider; waited Ns for a slot)" line and its "[label] ok/failed - ...
@@ -14,8 +15,12 @@ runs (103k, 2.0M) - and for Claude calls the call's own wall-clock and API time 
 models that served it ("model a+b"). Older start lines without the slot wait leave waited_seconds empty.
 Gemini calls report no cost and no usage on the finish line; their "[label]   tokens: input N (cached M), output K -
 models" line fills in cache read (M), input (N - M, the uncached part, as Claude reports it) and output, a JSON
-retry's line ("[label json retry]   tokens: ...") added in. Exit code 1 when a task's cost differs from summary.md;
-0 with a notice when there is no run yet.
+retry's line ("[label json retry]   tokens: ...") added in.
+A task runs from its "[Txx] task start (title)" line (pipeline/taskflow.py RunTask, once its upstream tasks are done)
+to its "[Txx] done -> ..." / "FAILED - ..." / "BLOCKED - ..." line. summary.md's Started and Duration columns
+(reporting/report.py Clock, Elapsed) must agree with them within CLOCK_TOLERANCE, and show "-" where the log has no
+start line (blocked) or no end line (aborted). Summaries without those columns (older runs) are compared by cost only.
+Exit code 1 when a task's cost or times differ from summary.md; 0 with a notice when there is no run yet.
 """
 from __future__ import annotations
 
@@ -47,9 +52,14 @@ USAGE_PART = re.compile(
 UNIT_SCALE = {"": 1, "k": 1000, "M": 1_000_000}
 MODEL_SEPARATOR = "+"  # runner.TokenUsage.Summary joins model IDs with it; the CSV uses ", " as Gemini lines do
 TASK_ID = re.compile(r"^T\d+")
+TASK_START = re.compile(r"^\[(?P<id>T\d+)\] task start \(")  # taskflow.RunTask, once its upstream tasks are done
+TASK_END = re.compile(r"^\[(?P<id>T\d+)\] (?:done -> |FAILED - |BLOCKED - )")  # a blocked task has no start line
 SUMMARY_TASK_ROW = re.compile(r"^\| (?P<id>T\d+) ")
 CELL_SPLIT = re.compile(r"(?<!\\)\|")
 SUMMARY_TOTAL = re.compile(r"^Total: \$(?P<cost>\d+\.\d+)$")
+SUMMARY_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"  # report.TIME_FORMAT, the Started column
+SUMMARY_SECONDS = re.compile(r"\((?P<seconds>\d+)s\)$")  # report.Elapsed: "0:12:34 (754s)"
+CLOCK_TOLERANCE = 1  # seconds: run.log stamps truncate to the second and summary.md's Duration rounds
 COST_DECIMALS = 3  # run.log and summary.md both print costs as %.3f
 ROUNDING = 0.5 * 10 ** -COST_DECIMALS
 COLUMNS = [
@@ -100,12 +110,33 @@ class Call:
 
 
 @dataclass
+class TaskTimes:
+    started: datetime | None = None  # its "task start" line; None = never started (blocked) or an older run.log
+    finished: datetime | None = None  # its done/FAILED/BLOCKED line; None = the run was aborted mid-task
+
+
+@dataclass
 class TaskSpan:
     taskId: str
     calls: int = 0
-    first: datetime | None = None
-    last: datetime | None = None
+    first: datetime | None = None  # the first call's start
+    last: datetime | None = None  # the last call's finish
     costUsd: float = 0.0
+    times: TaskTimes = field(default_factory=TaskTimes)
+
+    @property
+    def seconds(self) -> int | None:
+        """The task's own duration, as summary.md's Duration has it; None without both its start and end line."""
+        started, finished = self.times.started, self.times.finished
+        return int((finished - started).total_seconds()) if started and finished else None
+
+
+@dataclass
+class SummaryTask:
+    costUsd: float
+    timed: bool = False  # the task table has Started and Duration columns (older summaries have neither)
+    started: datetime | None = None  # "-": the task never started
+    seconds: int | None = None  # "-": never started, or not finished when the run was aborted
 
 
 def ParseUsage(text: str | None) -> tuple[dict[str, float], str]:
@@ -136,9 +167,10 @@ def RunStart(runId: str) -> datetime:
         sys.exit(f"error: {runId} is not a run ID (YYYYMMDD-HHMMSS): its run.log times have no date")
 
 
-def ParseLog(path: Path, runStart: datetime) -> list[Call]:
-    """Every agent call in run.log, in the order they started."""
+def ParseLog(path: Path, runStart: datetime) -> tuple[list[Call], dict[str, TaskTimes]]:
+    """Every agent call in run.log, in the order they started, and when each task started and ended."""
     calls: list[Call] = []
+    tasks: dict[str, TaskTimes] = {}
     running: dict[str, Call] = {}
     geminiTokens: dict[str, tuple[dict[str, int], str]] = {}  # logged before the call's finish line
     pending: tuple[datetime, str] | None = None  # a failed line whose error (CLI stderr) goes on over more lines
@@ -164,11 +196,15 @@ def ParseLog(path: Path, runStart: datetime) -> list[Call]:
             running[call.label] = call
         elif tokens := GEMINI_TOKENS.match(message):
             AddGeminiTokens(tokens, geminiTokens)
+        elif taskStart := TASK_START.match(message):
+            tasks.setdefault(taskStart["id"], TaskTimes()).started = moment
+        elif taskEnd := TASK_END.match(message):
+            tasks.setdefault(taskEnd["id"], TaskTimes()).finished = moment
         elif not Finish(message, moment, running, geminiTokens):
             failed = FAILED_START.match(message)
             if failed and failed["label"] in running:
                 pending = (moment, message)
-    return calls
+    return calls, tasks
 
 
 def AddGeminiTokens(tokens: re.Match, geminiTokens: dict[str, tuple[dict[str, int], str]]) -> None:
@@ -203,9 +239,10 @@ def Finish(message: str, moment: datetime, running: dict[str, Call],
     return True
 
 
-def TaskSpans(calls: list[Call]) -> dict[str, TaskSpan]:
-    """Per task: how many calls, from the first start to the last finish, and their cost together."""
-    spans: dict[str, TaskSpan] = {}
+def TaskSpans(calls: list[Call], tasks: dict[str, TaskTimes]) -> dict[str, TaskSpan]:
+    """Per task: its start and end lines, how many calls, from the first start to the last finish, and their cost
+    together."""
+    spans = {taskId: TaskSpan(taskId, times=times) for taskId, times in tasks.items()}
     for call in calls:
         span = spans.setdefault(call.taskId or "-", TaskSpan(call.taskId or "-"))
         span.calls += 1
@@ -216,23 +253,37 @@ def TaskSpans(calls: list[Call]) -> dict[str, TaskSpan]:
     return spans
 
 
-def SummaryCosts(path: Path) -> tuple[dict[str, float], float | None]:
-    """summary.md's Cost (USD) per task row and its Total line; ({}, None) when the run wrote no summary."""
+def SummaryTasks(path: Path) -> tuple[dict[str, SummaryTask], float | None]:
+    """summary.md's task rows (Cost (USD), and Started and Duration when it has them) and its Total line;
+    ({}, None) when the run wrote no summary."""
     if not path.is_file():
         return {}, None
-    costs: dict[str, float] = {}
-    costColumn, total = None, None
+    tasks: dict[str, SummaryTask] = {}
+    columns: dict[str, int] | None = None
+    total = None
     for line in path.read_text(encoding="utf-8").splitlines():
         cells = [cell.strip() for cell in CELL_SPLIT.split(line)[1:-1]]
         if cells[:1] == ["Task"] and "Cost (USD)" in cells:
-            costColumn = cells.index("Cost (USD)")
-        elif costColumn is not None and SUMMARY_TASK_ROW.match(line) and len(cells) > costColumn:
-            costs[cells[0].split(" ", 1)[0]] = float(cells[costColumn])
+            columns = {name: index for index, name in enumerate(cells)}
+        elif columns is not None and SUMMARY_TASK_ROW.match(line) and len(cells) == len(columns):
+            tasks[cells[0].split(" ", 1)[0]] = SummaryRow(cells, columns)
         elif match := SUMMARY_TOTAL.match(line):
             total = float(match["cost"])
         elif not line.strip():
-            costColumn = None  # the task table ended; the part table below has a Cost column too
-    return costs, total
+            columns = None  # the task table ended; the part table below has a Cost column too
+    return tasks, total
+
+
+def SummaryRow(cells: list[str], columns: dict[str, int]) -> SummaryTask:
+    """One task row; a Started or Duration of "-" stays None."""
+    row = SummaryTask(float(cells[columns["Cost (USD)"]]))
+    if "Started" not in columns or "Duration" not in columns:
+        return row
+    started, duration = cells[columns["Started"]], SUMMARY_SECONDS.search(cells[columns["Duration"]])
+    row.timed = True
+    row.started = datetime.strptime(started, SUMMARY_TIME_FORMAT) if started != "-" else None
+    row.seconds = int(duration["seconds"]) if duration else None
+    return row
 
 
 def Matches(logged: float, summary: float, calls: int) -> bool:
@@ -240,22 +291,50 @@ def Matches(logged: float, summary: float, calls: int) -> bool:
     return abs(logged - summary) <= ROUNDING * (calls + 1) + 1e-9
 
 
+def Near(logged, summary, tolerance) -> bool:
+    """Both missing ("-"), or both there and at most the tolerance apart."""
+    if logged is None or summary is None:
+        return logged is None and summary is None
+    return abs(logged - summary) <= tolerance
+
+
+def Differences(span: TaskSpan, summary: SummaryTask) -> list[str]:
+    """What summary.md says otherwise than run.log: the cost, and Started and Duration when it has those columns."""
+    differences = [] if Matches(span.costUsd, summary.costUsd, span.calls) else [f"${summary.costUsd:.3f}"]
+    if not summary.timed:
+        return differences
+    if not Near(span.times.started, summary.started, timedelta(seconds=CLOCK_TOLERANCE)):
+        differences.append(f"started {summary.started or '-'}")
+    if not Near(span.seconds, summary.seconds, CLOCK_TOLERANCE):
+        differences.append(f"duration {'-' if summary.seconds is None else f'{summary.seconds}s'}")
+    return differences
+
+
+def Interval(first: datetime, last: datetime | None) -> str:
+    """"2026-10-22 12:31:00-12:31:04 4s"; "2026-10-22 12:31:00- unfinished" when it has no end."""
+    if last is None:
+        return f"{first:%Y-%m-%d %H:%M:%S}- unfinished"
+    return f"{first:%Y-%m-%d %H:%M:%S}-{last:%H:%M:%S} {int((last - first).total_seconds())}s"
+
+
 def CompareWithSummary(spans: dict[str, TaskSpan], summaryPath: Path) -> list[str]:
-    """One line per task (span, calls, cost from run.log vs summary.md) and the run's total; mismatches are marked."""
-    costs, total = SummaryCosts(summaryPath)
+    """One line per task (its own span from the task start/end lines, its calls' span, calls and cost from run.log
+    vs summary.md) and the run's total; mismatches are marked."""
+    summaries, total = SummaryTasks(summaryPath)
     lines, mismatches = [], 0
-    for taskId in sorted(set(spans) | set(costs)):
+    for taskId in sorted(set(spans) | set(summaries)):
         span = spans.get(taskId, TaskSpan(taskId))
-        seconds = int((span.last - span.first).total_seconds()) if span.first and span.last else 0
-        logged = f"{span.first:%Y-%m-%d %H:%M:%S}-{span.last:%H:%M:%S} {seconds}s" if span.first else "no calls"
-        summary = costs.get(taskId)
+        logged = [f"task {Interval(span.times.started, span.times.finished)}"] if span.times.started else []
+        logged.append(f"calls {Interval(span.first, span.last)}" if span.first else "no calls")
+        summary = summaries.get(taskId)
+        differences = Differences(span, summary) if summary else []
         if summary is None:
             verdict = "not in summary.md"
-        elif Matches(span.costUsd, summary, span.calls):
+        elif not differences:
             verdict = "matches summary.md"
         else:
-            verdict, mismatches = f"MISMATCH: summary.md ${summary:.3f}", mismatches + 1
-        lines.append(f"{taskId}: {logged}, {span.calls} calls, ${span.costUsd:.3f} - {verdict}")
+            verdict, mismatches = f"MISMATCH: summary.md {', '.join(differences)}", mismatches + 1
+        lines.append(f"{taskId}: {', '.join(logged)}, {span.calls} calls, ${span.costUsd:.3f} - {verdict}")
     loggedTotal, callCount = sum(span.costUsd for span in spans.values()), sum(span.calls for span in spans.values())
     if total is None:
         lines.append(f"Total: ${loggedTotal:.3f} - no summary.md (run unfinished or aborted)")
@@ -269,11 +348,24 @@ def CompareWithSummary(spans: dict[str, TaskSpan], summaryPath: Path) -> list[st
     return lines
 
 
+def LatestRunDir() -> Path | None:
+    """The latest finished run (run.log and summary.md); the latest run with a run.log when none finished yet,
+    so a run in progress - one benchmarking from inside it, too - is not picked over a finished one. None when there
+    is no run at all."""
+    runs = sorted(path for path in RUNS_DIR.iterdir() if (path / "run.log").is_file()) if RUNS_DIR.is_dir() else []
+    if not runs:
+        return None
+    finished = [path for path in runs if (path / "summary.md").is_file()]
+    if finished:
+        return finished[-1]
+    print(f"note: no run in {RUNS_DIR} has a summary.md yet; using the latest run.log ({runs[-1].name})")
+    return runs[-1]
+
+
 def ResolveRunDir(target: str | None) -> Path | None:
     """The run folder to read; None when no target was given and no run has a run.log yet (nothing to benchmark)."""
     if target is None:
-        runs = sorted(path for path in RUNS_DIR.iterdir() if (path / "run.log").is_file()) if RUNS_DIR.is_dir() else []
-        return runs[-1] if runs else None
+        return LatestRunDir()
     path = Path(target)
     runDir = path if path.is_dir() else RUNS_DIR / target
     if not (runDir / "run.log").is_file():
@@ -300,11 +392,11 @@ def Main(argv: list[str] | None = None) -> int:
         print(f"no run with a run.log in {RUNS_DIR} yet - nothing to benchmark")
         return 0
     runId = runDir.name
-    calls = ParseLog(runDir / "run.log", RunStart(runId))
+    calls, tasks = ParseLog(runDir / "run.log", RunStart(runId))
     output = args.output or runDir / "calls.csv"
     WriteCsv(output, calls, runId)
     print(f"{len(calls)} calls -> {output}")
-    report = CompareWithSummary(TaskSpans(calls), runDir / "summary.md")
+    report = CompareWithSummary(TaskSpans(calls, tasks), runDir / "summary.md")
     print("\n".join(report))
     return 1 if "mismatch(es)" in report[-1] else 0
 

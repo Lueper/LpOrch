@@ -5,8 +5,8 @@
     notion  a Notion database read and written through core/notion.py, cached in TASKS.md: every Read() rewrites
             the file's task list from the rows, and the run then works on the file as with "file"
 Both answer the same questions the run needs: the tasks, the lines or rows that could not be read, and the
-writes back - a task's status marker, its "result:" location, and a new pending task for each follow-up an
-agent asked for.
+writes back - a task's status marker, its "result:" location, a new pending task for each follow-up an
+agent asked for, and the "todo:" lines for a person that hold back the tasks built on a task.
 """
 from __future__ import annotations
 
@@ -15,7 +15,9 @@ from pathlib import Path
 from core.config import SOURCE_NOTION, OrchConfig
 from core.notion import NotionDatabase, OpenDatabase
 from core.paths import TASKS_FILE
-from core.taskfile import AppendTask, ParseTasks, RecordResult, ReplaceTaskList, UnreadTaskLines, UpdateTaskStatus
+from core.taskfile import (
+    AddTodos, AppendTask, ParseTasks, RecordResult, ReplaceTaskList, UnreadTaskLines, UpdateTaskStatus,
+)
 from core.tasks import FollowUp, Task, TaskFileError
 
 
@@ -42,6 +44,10 @@ class TaskSource:
 
     def AddTask(self, followUp: FollowUp) -> tuple[str, str]:
         """Add a new pending task at the end of the list; returns its task ID and where it went."""
+        raise NotImplementedError
+
+    def AddTodos(self, task: Task, todos: list[str]) -> None:
+        """Write to-dos for a person under a task, as "todo:" detail lines."""
         raise NotImplementedError
 
     def NextNumber(self) -> int:
@@ -71,6 +77,9 @@ class FileTaskSource(TaskSource):
     def AddTask(self, followUp: FollowUp) -> tuple[str, str]:
         where = AppendTask(self.path, followUp)
         return ParseTasks(self.path)[-1].id, where  # IDs follow line order, and the new task is the last line
+
+    def AddTodos(self, task: Task, todos: list[str]) -> None:
+        AddTodos(self.path, task, todos)
 
     def NextNumber(self) -> int:
         return len(ParseTasks(self.path)) + 1
@@ -127,6 +136,10 @@ class NotionTaskSource(TaskSource):
             return taskId, f"{where}; {self.cache.AddTask(followUp)[1]}"
         except (TaskFileError, OSError) as error:  # the row exists, and the next Read() copies it to the file
             return taskId, f"{where}; not copied to {self.cache.path.name}: {error}"
+
+    def AddTodos(self, task: Task, todos: list[str]) -> None:
+        self.database.AddTodos(task, todos)  # the row first: the next Read() copies it to the file anyway
+        self.cache.AddTodos(task, todos)
 
     def NextNumber(self) -> int:
         return self.database.lastNumber + 1

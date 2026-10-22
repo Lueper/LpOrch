@@ -162,8 +162,8 @@ def ReviewPrompt(part: Part, peer: Part | None, ctx: RunContext) -> str:
 
 def OutputForReview(part: Part, ctx: RunContext) -> str:
     partDir = ctx.TaskDir(part.id)
-    # Follow-up tasks are written into the task list unreviewed otherwise, so the reviewer gets them too
-    followUps = f"\n\n{FollowUpText(part)}" if part.followUps else ""
+    # Follow-up tasks and to-dos are written into the task list unreviewed otherwise, so the reviewer gets them too
+    followUps = f"\n\n{FollowUpText(part)}" if part.followUps or part.todoAsked else ""
     if part.kind == "task":  # the list is the result: judged against the task list it is added to
         notes = partDir / "notes.md"
         assumptions = f"\n\n=== THE AUTHOR'S ASSUMPTIONS (not part of the list) ===\n{Clip(notes)}" if notes.is_file() else ""

@@ -1,6 +1,8 @@
 """Merge one task's parts into its own result, review the integrated result, and deliver it:
 doc/[Txx]_<YYMMDD>_<title>.md, staged code changes, system files applied when the run ends, a test's report only,
 or the tasks a [task] task wrote, added to the task list when the run ends.
+Code results are applied through the run's integration branch, one task after another, so two tasks that change
+the same file are merged rather than the second being refused (ApplyCode).
 """
 from __future__ import annotations
 
@@ -147,7 +149,8 @@ async def MergeTaskList(task: Task, ctx: RunContext, maxRounds: int) -> None:
     """Read the tasks a [task] worker wrote; orchestrate.AddNewTasks adds them to the task list when the run ends."""
     part = task.parts[0]
     part.merged = True
-    items, unread = ParseFollowUps((ctx.TaskDir(part.id) / "output.md").read_text(encoding="utf-8"), task.id)
+    items, todos, unread = ParseFollowUps((ctx.TaskDir(part.id) / "output.md").read_text(encoding="utf-8"), task.id)
+    task.todoAsked += todos  # a step only a person can take is written under this task, not added as a task
     if unread:  # a line meant as a task that cannot be read is worth seeing in summary.md and the report
         more = f" (+{len(unread) - MAX_UNREAD_SHOWN} more)" if len(unread) > MAX_UNREAD_SHOWN else ""
         task.notes.append(f"line(s) not read as a task: {'; '.join(unread[:MAX_UNREAD_SHOWN])}{more}")
@@ -205,7 +208,7 @@ async def MergeCodeTask(task: Task, ctx: RunContext, maxRounds: int) -> None:
     branch = f"orch/{ctx.runId}/{task.id}"
     worktree = ctx.worktreeDir / f"{task.id}-merge"
     try:
-        await GitCall(ctx, gitops.CreateWorktree, ctx.repoRoot, worktree, branch, ctx.baseCommit)
+        await GitCall(ctx, gitops.CreateWorktree, ctx.repoRoot, worktree, branch, task.gitBase)
     except gitops.GitError as error:
         task.error = f"integration branch setup failed: {error}"
         return
@@ -216,7 +219,7 @@ async def MergeCodeTask(task: Task, ctx: RunContext, maxRounds: int) -> None:
         if unmerged:
             task.error = "; ".join(f"{part.id} not merged: {'; '.join(part.notes[-1:])}" for part in unmerged)
             return
-        diff = lambda: GitCall(ctx, gitops.DiffAgainstBase, worktree, ctx.baseCommit)
+        diff = lambda: GitCall(ctx, gitops.DiffAgainstBase, worktree, task.gitBase)
         await ReviewWorkspace(task, ctx, maxRounds, worktree, diff)
     finally:
         await GitCall(ctx, gitops.RemoveWorktree, ctx.repoRoot, worktree)
@@ -230,7 +233,12 @@ async def MergePart(part: Part, worktree: Path, ctx: RunContext) -> None:
             part.merged = True
             return
         conflicts = await GitCall(ctx, gitops.ConflictedFiles, worktree)
-        if conflicts and await ResolveConflicts(part, worktree, conflicts, ctx):
+        situation = (
+            f"Merging branch {part.branch} (part {part.id}: {part.title}) into the integration branch of task "
+            f"{part.task.id} ({part.task.title}) stopped on conflicts. The integration branch already holds the "
+            "task's other parts."
+        )
+        if conflicts and await ResolveConflicts(part.task, f"{part.id} resolve conflicts", situation, worktree, conflicts, ctx):
             part.merged = True
             part.notes.append(f"merged after resolving conflicts in {', '.join(conflicts)}")
             return
@@ -240,39 +248,101 @@ async def MergePart(part: Part, worktree: Path, ctx: RunContext) -> None:
     await GitCall(ctx, gitops.AbortMerge, worktree)
 
 
-async def ResolveConflicts(part: Part, worktree: Path, conflicts: list[str], ctx: RunContext) -> bool:
+async def ResolveConflicts(
+    task: Task, label: str, situation: str, worktree: Path, conflicts: list[str], ctx: RunContext
+) -> bool:
+    """Let a code-merger agent resolve a merge that stopped on conflicts, and commit it; False when it could not."""
     spec = AgentSpec(role="code-merger", cwd=worktree, systemAppend=LoadPrompt("merger"))
-    prompt = (
-        f"Merging branch {part.branch} (part {part.id}: {part.title}) into the integration branch of task "
-        f"{part.task.id} ({part.task.title}) stopped on conflicts. The integration branch already holds the "
-        "task's other parts.\nConflicted files:\n" + "\n".join(f"- {name}" for name in conflicts)
-    )
-    result = await RunAgent(f"{part.id} resolve conflicts", prompt, spec, ctx)
-    part.task.costUsd += result.costUsd
+    prompt = situation + "\nConflicted files:\n" + "\n".join(f"- {name}" for name in conflicts)
+    result = await RunAgent(label, prompt, spec, ctx)
+    task.costUsd += result.costUsd
     if not result.ok:
         return False
     if await GitCall(ctx, gitops.HasConflictMarkers, worktree, conflicts):
-        ctx.log.warning("[%s] conflict markers remain after resolution attempt", part.id)
+        ctx.log.warning("[%s] conflict markers remain after resolution attempt", label)
         return False
     await GitCall(ctx, gitops.FinishMerge, worktree)
     return True
 
 
 async def ApplyCode(task: Task, branch: str, ctx: RunContext) -> None:
-    """Bring the task's result into the project as staged, uncommitted changes - unless it is blocked."""
+    """Bring the task's result into the project as staged, uncommitted changes - unless it is blocked.
+
+    The result is merged into the run's integration branch first, which holds every code result this run applied
+    before it: two tasks that change the same file are combined by a 3-way merge (a code-merger agent resolves
+    conflicts, and the task's verify: must still pass), and the working tree then gets what the merge added. Only
+    files a person changed since the run last wrote them keep the result out: then the patch is kept in the run
+    folder and applying it becomes a to-do for a person ("todo:" under the task), which holds back the tasks that
+    build on it.
+    """
     task.resultRef = f"branch {branch}"
     if Blocked(task, f"branch {branch} not applied"):
         return
-    try:
-        problem = await GitCall(ctx, gitops.ApplyToWorkingTree, ctx.repoRoot, ctx.baseCommit, branch)
-    except gitops.GitError as error:
-        problem = str(error)
-    if problem is None:
-        task.result = "staged in the working tree (review with git diff --cached, then commit)"
+    async with ctx.applyLock:  # one result at a time: each merge builds on the one before
+        try:
+            problem = await IntegrateAndApply(task, branch, ctx)
+        except gitops.GitError as error:
+            problem = str(error)
+    if problem in (None, gitops.NO_CHANGES):
+        task.result = ("nothing new to apply: the working tree holds this change already" if problem
+                       else "staged in the working tree (review with git diff --cached, then commit)")
         task.resultRef = f"staged in the project working tree (from branch {branch})"
         return
     ctx.log.warning("[%s] result not applied to the project: %s", task.id, problem)
-    task.result = f"branch {branch} - NOT applied ({problem}); apply with: git merge --squash {branch}"
+    patch = ctx.TaskDir(task.id) / "apply.patch"
+    try:
+        WriteText(patch, await GitCall(ctx, gitops.DiffPatch, ctx.repoRoot, task.gitBase, branch))
+        how = f"git apply --3way --index \"{patch.relative_to(ctx.projectDir).as_posix()}\""
+    except (gitops.GitError, OSError, ValueError):  # the branch stays: a person can still merge it by hand
+        how = f"git diff {task.gitBase} {branch} | git apply --3way --index"
+    task.result = f"branch {branch} - NOT applied ({problem}); apply with: {how}"
+    task.todoAsked.append(f"apply {task.id}'s code result, which was not applied ({problem}): {how}")
+
+
+async def IntegrateAndApply(task: Task, branch: str, ctx: RunContext) -> str | None:
+    """Merge the branch into the run's integration branch and stage what that adds in the working tree; returns why
+    it was not applied (gitops.NO_CHANGES when there was nothing to add). Called under ctx.applyLock."""
+    previous = ctx.appliedCommit or ctx.baseCommit
+    worktree = ctx.applyWorktree
+    if worktree is None:
+        worktree = ctx.worktreeDir / "_applied"
+        await GitCall(ctx, gitops.CreateWorktree, ctx.repoRoot, worktree, f"orch/{ctx.runId}/applied", previous)
+        ctx.applyWorktree = worktree
+    problem = await MergeIntoApplied(task, branch, worktree, ctx)
+    if problem:
+        return problem
+    tip = await GitCall(ctx, gitops.RevParse, worktree)
+    problem = await GitCall(ctx, gitops.ApplyToWorkingTree, ctx.repoRoot, previous, tip)
+    if problem in (None, gitops.NO_CHANGES):
+        ctx.appliedCommit = tip
+    else:  # the working tree did not take it: neither may the tasks that start after this one
+        await GitCall(ctx, gitops.ResetHard, worktree, previous)
+    return problem
+
+
+async def MergeIntoApplied(task: Task, branch: str, worktree: Path, ctx: RunContext) -> str | None:
+    """Merge a task's branch into the integration branch; returns why it could not be merged."""
+    previous = await GitCall(ctx, gitops.RevParse, worktree)
+    failure = await GitCall(ctx, gitops.StartMerge, worktree, branch)
+    if failure is None:
+        return None
+    conflicts = await GitCall(ctx, gitops.ConflictedFiles, worktree)
+    situation = (
+        f"Applying the result of task {task.id} ({task.title}): merging its branch {branch} into this run's"
+        " integration branch, which already holds the code results of other tasks applied before it, stopped on"
+        " conflicts. Keep the intent of both sides."
+    )
+    if not conflicts or not await ResolveConflicts(task, f"{task.id} apply merge", situation, worktree, conflicts, ctx):
+        await GitCall(ctx, gitops.AbortMerge, worktree)
+        listed = ", ".join(conflicts)
+        return f"conflicts with code results applied earlier in this run: {listed}" if conflicts else f"git merge failed: {failure}"
+    checks = await asyncio.to_thread(sandbox.RunChecks, "code", worktree, task.verify)
+    if checks and not checks[0]:  # the resolved merge must pass what the task's own result passed
+        WriteText(ctx.TaskDir(task.id) / "apply-checks.md", checks[1])
+        await GitCall(ctx, gitops.ResetHard, worktree, previous)
+        return f"verify failed after merging with code results applied earlier in this run ({', '.join(conflicts)})"
+    task.notes.append(f"merged with code results applied earlier in this run after resolving conflicts in {', '.join(conflicts)}")
+    return None
 
 
 # ---------- sys ----------

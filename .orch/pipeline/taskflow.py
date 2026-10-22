@@ -2,17 +2,19 @@
 
 Standard tasks: one agent, one fresh review, revision, and a verify only when the review found CRITICAL issues.
 "mode: full" tasks: planner-split parallel parts, ring review, every revision verified, merge + integration review.
-Every task runs this concurrently; a task with "after:" waits for those tasks and builds on their results.
+Every task runs this concurrently; a task with "after:" waits for those tasks and builds on their results - and
+stays pending while one of them has a "todo:" left for a person.
 """
 from __future__ import annotations
 
 import asyncio
 import traceback
+from datetime import datetime
 from typing import Callable
 
 from core.context import AddRefResults, RefSummary
 from core.runcontext import RunContext
-from core.tasks import HasCritical, Part, Task
+from core.tasks import HasCritical, OpenTodos, Part, Task
 from pipeline.merge import MergeTask
 from pipeline.phases import PartsNeedingRevision, ReviseParts, RunWork
 from pipeline.planning import PlanTask
@@ -26,6 +28,8 @@ async def RunTask(task: Task, ctx: RunContext, maxRounds: int, onFinished: Calla
         if problem:
             task.error, task.blocked = problem, True
         else:
+            task.startedAt = datetime.now()
+            ctx.log.info("[%s] task start (%s)", task.id, task.title)
             await RunTaskPhases(task, ctx, maxRounds)
             task.resultRun = ctx.runId  # recorded with the result: later tasks read this run's reviews
     except asyncio.CancelledError:  # the run was aborted: the task stays unfinished, so it is reported and reset as pending
@@ -35,6 +39,7 @@ async def RunTask(task: Task, ctx: RunContext, maxRounds: int, onFinished: Calla
         task.error = f"{type(error).__name__}: {error}"
         ctx.log.debug("[%s] crashed:\n%s", task.id, traceback.format_exc())
     task.finished = True
+    task.finishedAt = datetime.now()
     task.doneEvent.set()  # release downstream tasks even if this one crashed
     outcome = "BLOCKED" if task.blocked else "FAILED"
     ctx.log.info("[%s] %s", task.id, f"done -> {task.result}" if task.ok else f"{outcome} - {task.error}")
@@ -48,7 +53,12 @@ async def WaitForUpstream(task: Task, ctx: RunContext) -> str | None:
     for up in task.upstream:
         await up.doneEvent.wait()
     failed = [up.id for up in task.upstream if not up.ok]
-    return f"blocked: {', '.join(failed)} did not succeed; left pending" if failed else None
+    if failed:
+        return f"blocked: {', '.join(failed)} did not succeed; left pending"
+    # A to-do for a person under an upstream task (e.g. a code result this run could not apply) is a premise of
+    # this task: running it now would build on what is not there yet
+    waiting = [f"{up.id} ({OpenTodos(up)[0]})" for up in task.upstream if OpenTodos(up)]
+    return f"blocked: waiting for a person's to-do under {'; '.join(waiting)}; left pending" if waiting else None
 
 
 async def RunTaskPhases(task: Task, ctx: RunContext, maxRounds: int) -> None:

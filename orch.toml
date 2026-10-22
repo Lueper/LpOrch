@@ -16,10 +16,13 @@ provider = "claude"         # every role without its own provider below: claude 
 #   title    text       the task title
 #   kind     select     doc | code | sys | test | task (also "code:refactorer" for a role skill)
 #   status   status     with the options pending | running | done | failed  ->  [ ] [~] [x] [!]
-#   ref      text       base materials, one per line (path, glob, URL or task ID) - the "ref:" lines
+#   ref      text       base materials, one per line (path, glob, URL or task ID) - the "ref:" lines;
+#                       task IDs may share a line: "T01, T02"
 #   details  text       the other detail lines, one per line: "after: T01", "lang: en", "verify: ...",
-#                       "mode: full", instructions - exactly the lines you would indent under a task
+#                       "mode: full", instructions - exactly the lines you would indent under a task; the run
+#                       appends "todo: ..." lines here for what only a person can do (mark "todo: [x] ..." when done)
 #   result   text       written by the orchestrator: "doc/x.md (run 20261008-101500)"
+# A follow-up row's ref holds "T01 (origin)": the task a person wrote that its chain started from.
 # TASKS.md is then the cache: every run and preview rewrites its task list from the rows (the header stays),
 # the run works on the file as usual, and status, results and follow-up tasks go to the row and the file alike.
 # Edit tasks in Notion - edits to the cached lines are overwritten by the next run.
@@ -33,6 +36,10 @@ source = "file"             # where the task list lives: "file" = TASKS.md, "not
 # follow_ups = true           # a succeeded task may add the follow-up tasks its agents asked for to the task list
                             # (new pending tasks at the end, at most 5 per task)
                             # false = agents are not asked for them and nothing is written to the list
+max_followup_depth = 2      # follow-up generations that may grow from a task a person wrote (its origin); 0 = no limit
+max_followups_per_origin = 10  # follow-ups one origin may gather in all; 0 = no limit
+goal_reports = true         # a Korean goal report per origin once its follow-up chain ended or waits on a person's todo:
+
 
 # [notion]
 # database = ""             # the database link ("Copy link") or its 32-character id; the "?v=" view id is ignored

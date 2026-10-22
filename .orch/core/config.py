@@ -35,7 +35,10 @@ NOTION_KEYS: dict[str, type] = {"database": str, "token_env": str}
 SECTION_KEYS: dict[str, dict[str, type]] = {
     "run": {"max_parallel": int, "max_rounds": int, "budget_per_agent": float, "max_turns": int},
     "agent": {"provider": str},
-    "tasks": {"source": str, "follow_ups": bool},
+    "tasks": {
+        "source": str, "follow_ups": bool, "max_followup_depth": int, "max_followups_per_origin": int,
+        "goal_reports": bool,
+    },
     NOTION_SECTION: NOTION_KEYS,
     **{provider: PROVIDER_KEYS for provider in PROVIDERS},
 }
@@ -53,6 +56,9 @@ FIELDS = {
     "max_retries": "maxRetries",
     "source": "taskSource",
     "follow_ups": "followUps",
+    "max_followup_depth": "maxFollowUpDepth",
+    "max_followups_per_origin": "maxFollowUpsPerOrigin",
+    "goal_reports": "goalReports",
     "database": "database",
     "token_env": "tokenEnv",
 }
@@ -104,6 +110,11 @@ class OrchConfig:
     provider: str = "claude"  # every role without its own [roles.<role>] provider
     taskSource: str = SOURCE_FILE  # where the task list lives: TASKS.md or a Notion database
     followUps: bool = True  # let a finished task add the follow-up tasks its agents asked for to the task list
+    # A follow-up chain stays tied to the task a person wrote ("ref: T01 (origin)"): how many generations of
+    # follow-ups may grow from it, and how many follow-ups it may gather in all; 0 = no limit
+    maxFollowUpDepth: int = 2
+    maxFollowUpsPerOrigin: int = 10
+    goalReports: bool = True  # a Korean report on the origin's goal once its follow-up chain ends or waits on a person
     providers: dict[str, ProviderSettings] = field(default_factory=DefaultProviders)
     notion: NotionSettings = field(default_factory=NotionSettings)
     roles: dict[str, RoleSettings] = field(default_factory=dict)
@@ -213,6 +224,8 @@ def Problems(config: OrchConfig) -> list[str]:
         (config.budgetPerAgent > 0, "budget_per_agent (--budget-per-agent) must be > 0"),
         (config.maxTurns >= 1, "max_turns (--max-turns) must be >= 1"),
         (config.taskSource in TASK_SOURCES, f"[tasks] source (--source) must be one of: {', '.join(TASK_SOURCES)}"),
+        (config.maxFollowUpDepth >= 0, "[tasks] max_followup_depth must be >= 0; 0 = no limit"),
+        (config.maxFollowUpsPerOrigin >= 0, "[tasks] max_followups_per_origin must be >= 0; 0 = no limit"),
     ]
     for name, spec in PROVIDER_SPECS.items():  # retryLimit: the most the provider's CLI accepts
         retries, top = config.providers[name].maxRetries, spec.retryLimit

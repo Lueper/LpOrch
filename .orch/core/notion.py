@@ -11,10 +11,13 @@ One row is one task, laid out like a TASKS.md line and its detail lines:
     title    rich text  the task title
     kind     select     "doc" | "code" | "sys" | "test" | "task", or "code:refactorer" for a role skill
     status   status     pending | running | done | failed - the [ ] [~] [x] [!] markers
-    ref      rich text  base materials, one per line (path, glob, URL or task ID); each one is a "ref:" line
-    details  rich text  the other detail lines, one per line ("after: T01", "lang: en", "verify: ...", instructions)
+    ref      rich text  base materials, one per line (path, glob, URL or task ID); each line is a "ref:" line, and
+                        task IDs may share one: "T01, T02"
+    details  rich text  the other detail lines, one per line ("after: T01", "lang: en", "verify: ...", instructions,
+                        and "todo: ..." lines - what a person must do before work goes on - which the run may append)
     result   rich text  written by the orchestrator when a task succeeds: "doc/x.md (run 20261008-101500)"
 Rows are taken in task ID order, and a follow-up row gets the next free ID, so existing IDs never move.
+A follow-up row's ref holds "T01 (origin)", the task its chain started from.
 
 The integration must be invited to the database (Share -> Connections) and its token read from an
 environment variable (token_env, default NOTION_TOKEN); orch.toml is committed, so it holds no secret.
@@ -31,7 +34,7 @@ import urllib.request
 from dataclasses import dataclass, field
 
 from core.config import DEFAULT_TOKEN_ENV, NotionSettings
-from core.taskfile import DIRECTIVE_PATTERN, KINDS, RESULT_ARROW
+from core.taskfile import DIRECTIVE_PATTERN, KINDS, RESULT_ARROW, TodoLine
 from core.tasks import (
     STATUS_DONE, STATUS_FAILED, STATUS_PENDING, STATUS_RUNNING, TASK_KINDS, FollowUp, Task, TaskFileError, TaskId,
 )
@@ -49,7 +52,8 @@ CERTIFICATE_HINT = (
     ' "Install Certificates.command" in /Applications/Python 3.x once'
 )
 PAGE_SIZE = 100  # rows per query request (the API's maximum)
-MAX_TEXT_CHARS = 2000  # the API's limit per text chunk; titles and detail blocks written here stay well below
+MAX_TEXT_CHARS = 2000  # the API's limit per text chunk: longer texts are sent as several chunks
+MAX_TEXT_CHUNKS = 100  # the API's limit of rich text objects per property value
 MAX_ROWS = 500  # stop reading there instead of pulling an unexpectedly huge database into every prompt
 ID_PATTERN = re.compile(r"[0-9a-f]{32}", re.IGNORECASE)  # a Notion id once its dashes are removed
 # The database's properties, name -> Notion property type. Fixed in code rather than in orch.toml:
@@ -205,8 +209,10 @@ def OptionText(value: dict | None) -> str:
 
 
 def TextValue(text: str) -> dict:
-    """A rich_text property value; one chunk is enough for the short strings written here."""
-    return {"rich_text": [{"type": "text", "text": {"content": text[:MAX_TEXT_CHARS]}}] if text else []}
+    """A rich_text property value, in chunks of the API's size: a row's details are written back whole, and a long
+    instruction must not be cut off when a "todo:" line is appended to it."""
+    chunks = [text[start:start + MAX_TEXT_CHARS] for start in range(0, len(text), MAX_TEXT_CHARS)][:MAX_TEXT_CHUNKS]
+    return {"rich_text": [{"type": "text", "text": {"content": chunk}} for chunk in chunks]}
 
 
 def TitleValue(text: str) -> dict:
@@ -255,6 +261,7 @@ class Row:
     status: str  # a TASKS.md marker
     details: list[str]  # detail lines as TASKS.md holds them: Details first, then each Ref line as "ref: ..."
     result: str  # "doc/x.md (run 20261008-101500)"; empty until the task first succeeds
+    ownDetails: list[str] = field(default_factory=list)  # the Details property's lines alone: what a write keeps
 
     @property
     def taskId(self) -> str:
@@ -297,9 +304,10 @@ def ReadRow(page: dict) -> tuple[Row | None, str | None]:
     if problem:
         return None, f"notion row {cells[PROP_TASK] or '(no ID)'} '{title}': {problem}; not read as a task"
     refs = [f"ref: {REF_PREFIX.sub('', line)}" for line in TextLines(cells[PROP_REF])]
+    details = TextLines(cells[PROP_DETAILS])
     return Row(
         pageId=str(page.get("id") or ""), number=number, kind=kind["kind"].lower(), role=kind["role"], title=title,
-        status=status, details=TextLines(cells[PROP_DETAILS]) + refs, result=OneLine(cells[PROP_RESULT]),
+        status=status, details=details + refs, result=OneLine(cells[PROP_RESULT]), ownDetails=details,
     ), None
 
 
@@ -317,6 +325,7 @@ class NotionDatabase:
     # Property name -> its id, read by Check(). Writes are keyed by id because the API resolves a key by name or id:
     # the title property's id is always "title", so the rich_text property named "title" cannot be written by name
     propertyIds: dict[str, str] = field(default_factory=dict)
+    details: dict[str, list[str]] = field(default_factory=dict)  # page id -> its Details lines as read (AddTodos)
 
     @property
     def label(self) -> str:
@@ -366,6 +375,7 @@ class NotionDatabase:
                            f" '{rows[row.number].title}'; not read as a task")
             elif row:
                 rows[row.number] = row
+                self.details[row.pageId] = row.ownDetails
             if warning:
                 self.warnings.append(warning)
         # Rows not read as a task still hold their ID, so a follow-up row never reuses it
@@ -384,6 +394,14 @@ class NotionDatabase:
         run = f" (run {task.resultRun})" if task.resultRun else ""  # later tasks find its reviews in that run
         value = re.sub(r"[\r\n]+", " ", task.resultRef) + run
         UpdateRow(self.token, task.sourceId, self.ById({PROP_RESULT: TextValue(value)}))
+
+    def AddTodos(self, task: Task, todos: list[str]) -> None:
+        """Append "todo:" lines for a person to the row's Details, keeping what is there."""
+        if not task.sourceId:
+            return
+        lines = [*self.details.get(task.sourceId, []), *(TodoLine(todo) for todo in todos)]
+        UpdateRow(self.token, task.sourceId, self.ById({PROP_DETAILS: TextValue("\n".join(lines))}))
+        self.details[task.sourceId] = lines
 
     def AddTask(self, followUp: FollowUp) -> tuple[str, str]:
         """Create a pending row for a new task under the next free task ID; returns that ID and where the row is.

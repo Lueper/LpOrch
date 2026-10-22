@@ -54,7 +54,7 @@ RESPONSE_DELIVERY = (
 # (the role prompts in prompts/ are static and cannot be gated).
 FOLLOWUP_DELIVERY = "\n".join([
     "Follow-up tasks: finish the work asked of you first. If it uncovers something that needs a task of its own - "
-    "outside this task's scope, blocked on a decision someone else has to make, or a problem you must not fix here -"
+    "outside this task's scope, or a problem you must not fix here -"
     f" do not do it: name it below a line `{FOLLOWUP_MARKER}` at the very end of your message.",
     "- One per line in the task list's own syntax: `- [doc] <title>`, `- [code] <title>`, `- [sys] <title>`,"
     " `- [test] <title>` (`- [code:refactorer] <title>` picks a role skill). Indent detail lines under one to configure it:"
@@ -62,6 +62,15 @@ FOLLOWUP_DELIVERY = "\n".join([
     f"- The orchestrator appends them to the task list as new pending tasks ({MAX_FOLLOWUPS} per task at most) and"
     " a later run picks them up, so write titles that stand on their own without your session. Keep them few and"
     " concrete; do not restate what you already did or what this task's own result covers.",
+    "- Each follow-up must move the goal forward: the origin goal named above, or this task's own goal when none is"
+    " named. Building tools, re-checking or re-verifying around the goal is not a follow-up. Follow-up chains are"
+    " limited in depth, so propose the step that gets closest to the goal.",
+    "- The orchestrator ties each follow-up to this task and to the origin goal itself (`after:` and"
+    " `ref: Txx (origin)`); do not add those lines.",
+    "- What only a person can do - commit, merge or apply a branch, decide, act outside this project - is never a"
+    " task: list it in the same block as `- [todo] <what the person must do, concretely>`. It is written under this"
+    " task as a `todo:` line, and every task that builds on this one waits until the person marks it done, so list"
+    " only what work cannot go on without; never propose a task that assumes such a step already happened.",
     "- Omit the line when nothing is needed. Never edit the task list yourself, and never rely on a follow-up being"
     " done: your own result must be complete without it.",
 ])
@@ -80,6 +89,8 @@ def TaskListDelivery(firstNumber: int) -> str:
         " and to earlier tasks of your list.",
         f"- At most {MAX_WRITTEN_TASKS} tasks. Each title with its details must stand on its own: whoever runs it later"
         " sees nothing of this session. Do not repeat a task that is already in the task list.",
+        "- What only a person can do (commit, merge or apply a branch, decide, act outside this project) is not a"
+        " task: list it as `- [todo] <what the person must do>`; it is written under this task as a `todo:` line.",
         "- The orchestrator adds them as pending tasks when the run ends, and a later run executes them.",
         f"Assumptions you made go after the list, below a line `{NOTES_MARKER}`, as bullets; they go to the task's"
         " progress report. Omit that line when there is nothing to note.",
@@ -95,6 +106,8 @@ async def GitCall(ctx: RunContext, function, *args):
 # ---------- workspaces ----------
 
 async def RunWork(task: Task, ctx: RunContext) -> None:
+    if task.kind == "code":  # the code results this run applied so far, those of its "after:" tasks included
+        task.gitBase = ctx.appliedCommit or ctx.baseCommit
     problem = await asyncio.to_thread(PrepareSystemBase, task, ctx) if task.kind == "sys" else None
     for part in task.parts:
         part.error = problem or part.error
@@ -141,7 +154,7 @@ async def PrepareWorkspace(part: Part, ctx: RunContext) -> None:
     branch = f"orch/{ctx.runId}/{part.id}"
     worktree = ctx.worktreeDir / part.id
     try:
-        await GitCall(ctx, gitops.CreateWorktree, ctx.repoRoot, worktree, branch, ctx.baseCommit)
+        await GitCall(ctx, gitops.CreateWorktree, ctx.repoRoot, worktree, branch, part.task.gitBase)
     except gitops.GitError as error:
         part.error = str(error)
         return
@@ -192,7 +205,7 @@ async def SaveOutput(part: Part, text: str, ctx: RunContext, commitMessage: str)
             part.notes.append(f"ignored files outside the system scope: {', '.join(stray[:5])}")
     else:
         changed = await GitCall(ctx, gitops.CommitAll, part.worktree, commitMessage)
-        diff = await GitCall(ctx, gitops.DiffAgainstBase, part.worktree, ctx.baseCommit)
+        diff = await GitCall(ctx, gitops.DiffAgainstBase, part.worktree, part.task.gitBase)
     ArchiveAndWrite(partDir / "output.diff", diff, part.revisions)
     ArchiveAndWrite(partDir / "notes.md", text, part.revisions)
     return changed
@@ -221,6 +234,8 @@ async def RunChecks(subject, task: Task, workdir: Path | None, ctx: RunContext) 
     """Run the automated checks of a code/sys workspace and record them on the part or task."""
     if task.kind not in ("code", "sys") or workdir is None:  # a test runs its own commands and reports them
         return
+    if task.kind == "sys" or task.verify:  # what sandbox.RunChecks runs; otherwise it returns None
+        ctx.log.info("[%s] automated checks start", subject.id)
     outcome = await asyncio.to_thread(sandbox.RunChecks, task.kind, workdir, task.verify)
     if outcome is None:
         return
@@ -291,12 +306,14 @@ def TakeFollowUps(subject: Part | Task, text: str, ctx: RunContext, replace: boo
     stripped. A revision that lists follow-ups replaces the earlier list: the reviewer may have asked for one to
     be dropped, and a silent revision keeps what there was.
     """
-    rest, items, unread = SplitFollowUps(text, subject.id)
+    rest, items, todos, unread = SplitFollowUps(text, subject.id)
     if not ctx.config.followUps:
-        if items:
-            ctx.log.info("[%s] %d proposed follow-up task(s) ignored ([tasks] follow_ups = false)", subject.id, len(items))
+        if items or todos:
+            ctx.log.info("[%s] %d proposed follow-up task(s) and to-do(s) ignored ([tasks] follow_ups = false)",
+                         subject.id, len(items) + len(todos))
         return rest
     subject.followUps = items if items and replace else subject.followUps + items
+    subject.todoAsked = todos if todos and replace else subject.todoAsked + todos
     if unread:  # a list item meant as a task that nobody can read is worth seeing in summary.md
         more = f" (+{len(unread) - MAX_UNREAD_SHOWN} more)" if len(unread) > MAX_UNREAD_SHOWN else ""
         subject.notes.append(f"follow-up line(s) not read as a task: {'; '.join(unread[:MAX_UNREAD_SHOWN])}{more}")
@@ -304,15 +321,17 @@ def TakeFollowUps(subject: Part | Task, text: str, ctx: RunContext, replace: boo
 
 
 def FollowUpText(subject: Part | Task) -> str:
-    """The follow-up tasks an agent asked for, as the reviewer sees them: they go into the task list verbatim."""
-    if not subject.followUps:
+    """The follow-up tasks and to-dos an agent asked for, as the reviewer sees them: they go into the task list
+    verbatim - the tasks at its end, the to-dos as "todo:" lines under this task."""
+    if not subject.followUps and not subject.todoAsked:
         return ""
     lines = []
     for item in subject.followUps:
         role = f":{item.role}" if item.role else ""
         lines += [f"- [{item.kind}{role}] {item.title}", *(f"    {detail}" for detail in item.details)]
+    lines += [f"- [todo] {item}" for item in subject.todoAsked]
     return "\n".join([
-        "=== FOLLOW-UP TASKS THE AUTHOR ASKED FOR (appended to the task list, not part of the result) ===",
+        "=== FOLLOW-UP TASKS AND TO-DOS THE AUTHOR ASKED FOR (added to the task list, not part of the result) ===",
         *lines,
     ])
 
