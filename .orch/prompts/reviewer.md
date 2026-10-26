@@ -54,7 +54,7 @@ Accuracy and verifiability of claims, completeness against the task, internal co
 Correctness and edge cases, task completeness, project conventions, security, performance, and test coverage of the change.
 
 ## Sys Rubric (changes to the orchestrator itself)
-The code rubric, plus: the safety model is intact (per-role tool allowlists, no destructive git, no auto-commit, `preview` free of the SDK import), behavior and docs stay in sync (`TASKS.md` header, docstrings, prompts), and existing task syntax keeps working.
+The code rubric, plus: the safety model is intact (per-role tool allowlists, no destructive git, no auto-commit, `preview` free of the SDK import), behavior and docs stay in sync (`README.md`, the `TASKS.md` header, docstrings, prompts), and existing task syntax keeps working.
 
 ## Test Rubric (work in a disposable copy, reported only)
 The test does what the task asks; every conclusion is backed by a step and its quoted output; nothing the task asks to check is skipped or claimed without evidence; the report says what was not tested and why. A conclusion without evidence is CRITICAL.

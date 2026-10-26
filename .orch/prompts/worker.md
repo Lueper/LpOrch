@@ -49,7 +49,7 @@ Every request of this session re-reads everything already in it, so what you pul
 - Never run the orchestrator except with `preview`: a plain run would start real agents.
 - Do not change task status markers in `TASKS.md`; the orchestrator manages them. Updating its header comment is fine.
 - Preserve the safety model: per-role tool allowlists, no destructive git commands, no auto-commit, `claude_agent_sdk` imported only inside `agents/claude.py` calls (so `preview` and Gemini-only setups run without it).
-- Follow the project conventions (PascalCase functions, camelCase variables, early return). Keep docstrings, comments and the `TASKS.md` header in sync with behavior you change.
+- Follow the project conventions (PascalCase functions, camelCase variables, early return). Keep docstrings, comments, `README.md` (the full task list guide) and the `TASKS.md` header (its quick reference) in sync with behavior you change.
 - Final message: a short summary with files changed, rationale, check results, and assumptions.
 
 ## Test Tasks

@@ -212,7 +212,11 @@ claude와 gemini는 interface가 같은 backend로 대칭 구성됨.
 
 - `<kind>` : `doc` / `code` / `sys` / `test` / `task` 중 하나
 - `<role>` : (선택) `.claude/skills/develop/<role>.md` 스킬 추가 주입 (예: `code:refactorer`, `doc:researcher`)
+- 작업 ID는 줄 순서를 따름(`T01`, `T02`, …). 새 작업은 목록 끝에 추가해야 기존 ID와 이를 가리키는 `after:`·`ref:`가 유지됨 (Notion 모드는 `task` 속성이 ID)
 - 상태 마커: `[ ]` 대기, `[~]` 실행 중, `[x]` 완료, `[!]` 실패. `[!]`/`[x]`를 `[ ]`로 되돌리면 재시도됨
+  - `after:` 작업이 성공하지 못한 Task는 `[ ]`(blocked)로 남고 다음 run에 다시 시도됨
+  - 처리되지 않은 `todo:`에 막힌 Task는 `waiting:`으로 표시되고 그 `todo:`가 끝날 때까지 시작되지 않음
+- `TASKS.md` 상단 주석은 요약본(quick reference)이며, 상세 설명은 이 섹션이 기준임
 - 구분 공백과 checkbox는 생략 가능하고 대소문자는 무시됨: `-[doc]제목`, `- [][Doc] 제목`, `- [ ] [doc] 제목`은 모두 같은 대기 작업. 실행되는 작업 줄은 표준 형식(`- [~] [doc] 제목`)으로 다시 쓰임
 - 작업처럼 보이지만 인식되지 않는 줄(`- [ ] [docs] x`, `* [ ] [doc] x`, 제목 없는 `- [ ] [doc]` 등)도 있음. 이런 줄은 `orch preview`·`orch` 실행 시 `warning: TASKS.md line N is not read as a task ...`로 표시됨. 실행은 계속됨. Notion 모드에서는 읽히지 않은 **행**이 같은 방식으로 경고됨
 
@@ -242,14 +246,14 @@ claude와 gemini는 interface가 같은 backend로 대칭 구성됨.
 | directive | 의미 |
 |---|---|
 | `after: Txx, Tyy` | 지정한 작업들이 끝날 때까지 대기 후 그 결과를 입력으로 사용. 지정한 작업에 처리되지 않은 `todo:`가 있으면 그것이 끝날 때까지 대기 |
-| `ref: <path\|URL>` | 작업의 근거 자료(파일/폴더/glob/URL). 작은 텍스트 파일은 프롬프트에 직접 삽입되고 리뷰어가 대조 검증함. 경로 구분자는 OS와 무관하게 `/`, `\` 모두 가능. 여러 개는 줄을 나눠 적음 |
-| `ref: Txx` | 그 작업의 결과물과 리뷰 이력을 근거 자료로 씀(같은 run이면 대기). 작업 ID는 한 줄에 여러 개 적을 수 있고 경로와 섞어도 됨: `ref: T01, T02`, `ref: T01 T02`, `ref: T01, doc/x.md` |
+| `ref: <path\|URL>` | 작업의 근거 자료(파일/폴더/glob/URL). 작은 텍스트 파일은 프롬프트에 직접 삽입되고 리뷰어가 대조 검증함. 경로는 프로젝트 기준 상대 경로이고, 구분자는 OS와 무관하게 `/`, `\` 모두 가능하며 `~\doc\x.md`도 프로젝트 루트 기준으로 해석됨. 존재하지 않는 경로가 있으면 run이 시작되지 않음. 여러 개는 줄을 나눠 적음 |
+| `ref: Txx` | 그 작업의 결과물과 리뷰 이력을 근거 자료로 씀(같은 run이면 대기). 작업 ID는 한 줄에 여러 개 적을 수 있고 경로와 섞어도 됨: `ref: T01, T02`, `ref: T01 T02`, `ref: T01, doc/x.md`. 완료된 Task가 참조 작업의 현재 결과보다 이전 결과를 기반으로 만들어졌으면 preview가 알려줌 |
 | `ref: Txx (origin)` | 후속 작업이 섬기는 목표 — 체인이 시작된, 사람이 쓴 Task. 오케스트레이터가 후속 작업마다 자동 기록하며 `ref: Txx`처럼 그 결과를 근거 자료로 씀 |
 | `todo: <할 일>` | 사람만 할 수 있는 조치(merge·commit·결정 등). 이 줄이 남아 있는 동안 이 Task와 이를 기반으로 하는 Task는 실행되지 않음. 처리 후 줄을 지우거나 `todo: [x] <할 일>`로 표시함(완료 기록은 이후 작업의 참고 정보로 전달됨). 에이전트 제안이나 오케스트레이터(반영 실패한 code 결과)가 자동 기록함 |
 | `lang: en` | doc 산출물 출력 언어 지정 (기본값: 한국어) |
 | `verify: <command>` | code/sys 작업에서 반드시 통과해야 하는 쉘 커맨드. Windows는 `cmd.exe`, macOS/Linux는 `/bin/sh`에서 실행됨 |
-| `mode: full` | 대규모 작업을 1~4개 에이전트로 분할하는 멀티 에이전트 파이프라인 사용 (기본값: standard, 1에이전트+1리뷰) |
-| `→ result: <location>` | 작업 성공 시 오케스트레이터가 자동 기록 — `doc`은 `doc/` 문서, 그 외 kind는 `report/` 진행 보고 경로. `after:`·`ref: Txx`가 이 값을 읽음. 사람이 직접 쓸 필요 없음 |
+| `mode: full` | 대규모 작업을 1~4개 에이전트로 분할하는 멀티 에이전트 파이프라인 사용 (기본값: standard, 1에이전트+1리뷰). `test`·`task`에는 적용 안 됨 |
+| `→ result: <location>` | 작업 성공 시 오케스트레이터가 자동 기록 — `doc`은 `doc/` 문서, 그 외 kind는 `report/` 진행 보고 경로. `after:`·`ref: Txx`가 이 값을 읽음. 사람이 직접 쓸 필요 없으며, 재실행 시 그대로 두거나 지워도 됨 |
 
 ### 후속 작업(follow-up) 자동 추가
 
@@ -348,6 +352,9 @@ claude와 gemini는 interface가 같은 backend로 대칭 구성됨.
 - 목표 종합 보고 → origin 체인이 끝나거나 사람 조치 대기로 멈추면 `report/[Txx]_<YYMMDD>_목표_보고_<제목>.md` (`summary.md`의 "Goal reports"에 경로·비용 기록)
 - 진행 보고 → 실행된 Task마다 `report/[Txx]_<YYMMDD>_<제목>.md` 생성 (code·doc·sys 모두). sys는 적용 여부와 원본 백업 위치를 포함함. run 종료 시 `small_model`(기본 haiku)이 run 기록(`run.log`, `notes`/`review`/`response`/`checks`, 변경 파일 또는 문서 목차)을 읽고 개요·진행 경과·작업 내용·가정 사항·리뷰 지적사항 및 처리 결과·후속 조치를 한국어로 정리함. 요약 실패 시 원자료를 그대로 기록함. `after:` 선행 실패로 blocked된 Task는 제외됨. `doc` 외 kind는 이 보고서가 결과 문서가 되어 작업 목록의 결과 줄(`→ result:`, Notion `result`)이 이를 가리킴
 - 로그/리뷰/요약 → `.orch/runs/<run-id>/summary.md`에서 작업별 상태·파트 수·리뷰 결과·비용 확인 가능
+- 초기화 → `orch-reset`(PowerShell: `.\orch-reset`, macOS/Linux: `./orch-reset.sh`)이 삭제 대상 개수를 보여주고 확인받은 뒤 영구 삭제함. `orch-reset --yes`는 확인 생략
+  - 삭제: `doc/*.md`(`doc/refs/` 같은 하위 폴더는 유지), `report/*.md`, `.orch/runs/*`, `.orch/worktrees/*`, Python 캐시, `TASKS.md`의 작업 목록(상단 주석은 유지)
+  - Notion 작업 목록은 건드리지 않음 (위 "작업 목록을 Notion 데이터베이스로 쓰기" 참고)
 
 ## 디렉터리 구조
 
