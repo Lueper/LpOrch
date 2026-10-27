@@ -12,8 +12,8 @@ import re
 from pathlib import Path
 
 from core.tasks import (
-    MODE_FULL, MODE_STANDARD, ORIGIN_MARKER, SINGLE_PART_KINDS, STATUS_PENDING, TASK_KINDS, FollowUp, Task,
-    TaskFileError,
+    MODE_FULL, MODE_STANDARD, ORIGIN_MARKER, RUN_STATUSES, SINGLE_PART_KINDS, STATUS_PENDING, TASK_KINDS, FollowUp,
+    Task, TaskFileError,
 )
 
 KINDS = "|".join(TASK_KINDS)  # "doc|code|sys|test|task", for the patterns below
@@ -286,19 +286,20 @@ def AppendTask(path: Path, followUp: FollowUp) -> str:
 # ---------- dependencies ----------
 
 def LinkDependencies(tasks: list[Task]) -> list[str]:
-    """Resolve every task's "after:" IDs to tasks and check its settings; returns errors that stop pending tasks."""
+    """Resolve every task's "after:" IDs to tasks and check its settings; returns errors that stop the tasks to run
+    (pending and failed)."""
     byId = {task.id: task for task in tasks}
     errors = []
     for task in tasks:
         task.upstream = [byId[dep] for dep in dict.fromkeys(task.after) if dep in byId and dep != task.id]
         unknown = [dep for dep in task.after if dep not in byId]
-        if task.status == STATUS_PENDING and unknown:
+        if task.status in RUN_STATUSES and unknown:
             errors.append(f"{task.id} after: unknown task {', '.join(unknown)}")
-        if task.status == STATUS_PENDING and task.id in task.after:
+        if task.status in RUN_STATUSES and task.id in task.after:
             errors.append(f"{task.id} after: a task cannot wait for itself")
-        if task.status == STATUS_PENDING and task.mode not in (MODE_STANDARD, MODE_FULL):
+        if task.status in RUN_STATUSES and task.mode not in (MODE_STANDARD, MODE_FULL):
             errors.append(f"{task.id} mode: unknown mode '{task.mode}' (use: {MODE_FULL})")
-        if task.status == STATUS_PENDING and task.full and task.kind in SINGLE_PART_KINDS:
+        if task.status in RUN_STATUSES and task.full and task.kind in SINGLE_PART_KINDS:
             errors.append(f"{task.id} mode: {MODE_FULL} is not available for {task.kind} tasks (they run as one agent)")
     cycle = FindCycle(tasks)
     if cycle:
@@ -307,7 +308,7 @@ def LinkDependencies(tasks: list[Task]) -> list[str]:
 
 
 def FindCycle(tasks: list[Task]) -> list[str] | None:
-    """A loop of pending tasks waiting on each other, or None."""
+    """A loop of tasks to run (pending or failed) waiting on each other, or None."""
     visiting: list[Task] = []
     cleared: set[str] = set()
 
@@ -318,14 +319,14 @@ def FindCycle(tasks: list[Task]) -> list[str] | None:
             return [item.id for item in visiting[visiting.index(task):]] + [task.id]
         visiting.append(task)
         for up in task.upstream:
-            cycle = Visit(up) if up.status == STATUS_PENDING else None
+            cycle = Visit(up) if up.status in RUN_STATUSES else None
             if cycle:
                 return cycle
         visiting.pop()
         cleared.add(task.id)
         return None
 
-    pending = [task for task in tasks if task.status == STATUS_PENDING]
+    pending = [task for task in tasks if task.status in RUN_STATUSES]
     return next((cycle for cycle in map(Visit, pending) if cycle), None)
 
 

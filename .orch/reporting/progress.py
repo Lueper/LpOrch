@@ -128,9 +128,9 @@ def IsTaskEvent(task: Task, line: str) -> bool:
 def Artifacts(task: Task, ctx: RunContext) -> list[str]:
     """The text artifacts of the task's part folders and its own folder, oldest round first."""
     folders = [ctx.runDir / part.id for part in task.parts] + [ctx.runDir / task.id]
-    # A sys task's sys.diff is its merged change, the one applied to the project; the parts' final output.diff
-    # would list the same files again
-    merged = task.kind == "sys" and (ctx.runDir / task.id / "sys.diff").is_file()
+    # A sys task's sys.diff (a code task's code.diff) is its merged change, the one applied to the project; the parts'
+    # final output.diff would list the same files again
+    merged = task.kind in ("code", "sys") and (ctx.runDir / task.id / f"{task.kind}.diff").is_file()
     blocks = []
     for folder in (path for path in folders if path.is_dir()):
         for path in sorted((path for path in folder.iterdir() if path.is_file()), key=ArtifactOrder):

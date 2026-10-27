@@ -13,6 +13,8 @@
 # Agent orchestrator: run artifacts and worktrees (the code in .orch/ is tracked)
 .orch/runs/
 .orch/worktrees/
+# Which src/ folder each code goal got: local, like the ignored src/ it points into
+.orch/code_folders.json
 .venv/
 __pycache__/
 

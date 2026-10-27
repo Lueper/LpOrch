@@ -33,16 +33,17 @@ Every request of this session re-reads everything already in it, so what you pul
 - Keep assumptions out of the document - no `## Assumptions` section. If you made any, add the line `=== NOTES FOR THE REPORT ===` after the document and list them below it as bullets. Everything below that line goes to the task's progress report.
 
 ## Code Tasks
-- You are in an isolated git worktree on a dedicated branch. Edit files in place.
-- Do not commit, push, switch branches, stash, or change git configuration. The orchestrator commits your changes.
+- Your working directory is the task's code folder, `src/<project>/` in the project, named for the origin goal (the task names it as "Code folder"), or, for a split part, a temporary copy of it that the orchestrator merges back. Every code task serving the same origin goal works in that folder, so build on what is already there.
+- Edit and create files only inside your working directory: edits elsewhere are blocked, and never write outside it with shell commands either. Keep the code self-contained there: its own tests, data and instructions, with paths relative to the folder.
+- It is not a git repository: do not run git commands (init, commit, branch, stash). The orchestrator keeps your changes when the checks and reviews pass, and rolls the folder back otherwise.
 - Keep the change minimal and focused. Do not reformat unrelated code.
-- Run the project's existing tests or build if they exist and are quick. A "Required check" in the task is run by the orchestrator after every change and must pass.
-- Never run commands that affect anything outside this worktree.
+- Run the folder's existing tests or build if they exist and are quick. A "Required check" in the task is run by the orchestrator in the code folder after every change and must pass.
+- Never run commands that affect anything outside your working directory.
 - Final message: a short summary with files changed, rationale, test results, and assumptions.
 
-## Sys Tasks (changing the orchestrator itself)
-- You are in a sandbox copy of the orchestrator's own files: `.orch/` (code and prompts), `.claude/` (skills, hooks, settings), `CLAUDE.md`, `README.md`, `TASKS.md`, `orch.toml`, and the launchers `orch.bat`, `orch-reset.bat` (Windows) and `orch.sh`, `orch-reset.sh` (macOS/Linux). Edit them in place.
-- Only files in that scope are applied; anything else you create is ignored. Never edit the real project outside this sandbox.
+## Sys Tasks (changing the project system: the orchestrator and any other project file)
+- You are in a sandbox copy of the whole project: the orchestrator's own files - `.orch/` (code and prompts), `.claude/` (skills, hooks, settings), `CLAUDE.md`, `README.md`, `TASKS.md`, `orch.toml`, and the launchers `orch.bat`, `orch-reset.bat` (Windows) and `orch.sh`, `orch-reset.sh` (macOS/Linux) - and every other folder (`src/`, `doc/`, ...). Edit them in place.
+- Left out of the copy and never applied: git data, the run artifacts in `.orch/runs/` and `.orch/worktrees/` and the code folder record `.orch/code_folders.json`, caches and virtual environments, and local or secret files (`.env`, `.mcp.json`, `settings.local.json`, `*.log`). Edits outside this sandbox are blocked; never touch the real project with shell commands either.
 - After every change the orchestrator compiles and imports every Python module under `.orch/` (its packages included), runs `.orch/orchestrate.py preview`, and parses JSON settings. Fix what fails. You may run these yourself (`python` on Windows, `python3` on macOS/Linux).
 - LpOrch runs on Windows and macOS alike. Change both launchers of a pair together (`orch.bat` with `orch.sh`, `orch-reset.bat` with `orch-reset.sh`); `.sh` files keep LF line endings. Keep `.orch/` code OS-neutral: `pathlib` paths, subprocess argument lists instead of shell strings, and a `sys.platform` branch only where the OSes really differ.
 - `.orch/` packages import only the ones before them: `core/` -> `workspace/` -> `agents/` -> `reporting/` -> `pipeline/`. Provider-specific code stays in its backend (`agents/claude.py`, `agents/gemini.py`) and its registry entry (`core/providers.py`).
@@ -55,7 +56,7 @@ Every request of this session re-reads everything already in it, so what you pul
 ## Test Tasks
 - You are in a disposable copy of the whole project as it is now, uncommitted changes included (git data is left out, so it is not a git repository). Change files and run commands as the test needs.
 - Nothing you change is kept: the copy is deleted when the run ends and the project itself is never touched. Your final message - the test report - is the only result; the orchestrator turns it into the task's progress report.
-- Never act outside the copy: no writes over the network or to external services (the Notion task list included), no installing or removing packages, and never run the orchestrator except with `preview`.
+- Never act outside the copy: file edits elsewhere are blocked; no writes over the network or to external services (the Notion task list included), no installing or removing packages, and never run the orchestrator except with `preview`.
 - Final message: the test report - what you ran or tried, the outcome of each step with the relevant output quoted, your conclusion, the files you changed in the copy, and your assumptions.
 
 ## Task Tasks (writing new tasks)

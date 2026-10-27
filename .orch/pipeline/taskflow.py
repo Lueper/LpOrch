@@ -16,7 +16,7 @@ from core.context import AddRefResults, RefSummary
 from core.runcontext import RunContext
 from core.tasks import HasCritical, OpenTodos, Part, Task
 from pipeline.merge import MergeTask
-from pipeline.phases import PartsNeedingRevision, ReviseParts, RunWork
+from pipeline.phases import CodeFolder, PartsNeedingRevision, ReviseParts, RunWork
 from pipeline.planning import PlanTask
 from pipeline.review import ReviewTask, VerifyParts
 from reporting.report import UpstreamHistory
@@ -70,15 +70,16 @@ async def RunTaskPhases(task: Task, ctx: RunContext, maxRounds: int) -> None:
     if task.history:
         sources = [f"{up.id} (run {up.resultRun})" for up in task.upstream if up.resultRun]
         ctx.log.info("[%s] history recognized: %s - %d chars of reviews and responses", task.id, ", ".join(sources), len(task.history))
-    await PlanTask(task, ctx)
-    await RunWork(task, ctx)
-    failed = [part for part in task.parts if not part.ok]
-    if failed:  # a missing part would make the merged result incomplete
-        task.error = "; ".join(f"{part.id}: {part.error}" for part in failed)
-        return
-    if maxRounds > 0:
-        await ReviewParts(task, ctx, maxRounds)
-    await MergeTask(task, ctx, maxRounds)
+    async with CodeFolder(task, ctx):  # code: holds its src/ folder, rolled back unless the task succeeds
+        await PlanTask(task, ctx)
+        await RunWork(task, ctx)
+        failed = [part for part in task.parts if not part.ok]
+        if failed:  # a missing part would make the merged result incomplete
+            task.error = "; ".join(f"{part.id}: {part.error}" for part in failed)
+            return
+        if maxRounds > 0:
+            await ReviewParts(task, ctx, maxRounds)
+        await MergeTask(task, ctx, maxRounds)
 
 
 async def ReviewParts(task: Task, ctx: RunContext, maxRounds: int) -> None:

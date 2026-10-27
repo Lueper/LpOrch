@@ -20,22 +20,22 @@ from core.runcontext import RunContext
 FRONTMATTER = re.compile(r"\A---\r?\n.*?\r?\n---\r?\n", re.DOTALL)
 
 READ_TOOLS = ["Read", "Glob", "Grep"]
-# Each role sees only the built-in tools it needs; write access is limited to code roles (keys = config.ROLES).
+# Each role sees only the built-in tools it needs; write access is limited to the workers of code, sys and test
+# tasks, and their file writes to their workspace - the agent's cwd (claude.py, gemini_guard.py) (keys = config.ROLES).
 # Claude Code's tool names are the common vocabulary: each backend maps them to its own tools
 ROLE_TOOLS = {
     "doc-worker": [*READ_TOOLS, "WebSearch", "WebFetch"],
-    "code-worker": [*READ_TOOLS, "Edit", "Write", "Bash"],
-    "sys-worker": [*READ_TOOLS, "Edit", "Write", "Bash"],  # edits a sandbox copy of the orchestrator itself
+    "code-worker": [*READ_TOOLS, "Edit", "Write", "Bash"],  # works in its origin goal's folder under src/
+    "sys-worker": [*READ_TOOLS, "Edit", "Write", "Bash"],  # edits a sandbox copy of the whole project
     "test-worker": [*READ_TOOLS, "Edit", "Write", "Bash"],  # works in a disposable copy of the project
     "task-worker": READ_TOOLS,  # reads the project to plan; its final message is the task list
     "reviewer": READ_TOOLS,
     "doc-merger": READ_TOOLS,
-    "code-merger": [*READ_TOOLS, "Edit"],
     "planner": READ_TOOLS,  # may look at the project to split along real files or sections
     "namer": [],  # answers from the prompt alone
     "reporter": [],  # summarizes the run's records, all of which are in the prompt
 }
-WRITE_ROLES = {"code-worker", "sys-worker", "test-worker", "code-merger"}
+WRITE_ROLES = {"code-worker", "sys-worker", "test-worker"}
 # Tool input keys worth echoing in progress lines, in priority order
 PROGRESS_KEYS = ("file_path", "pattern", "command", "url", "query", "path")
 MAX_CONSOLE_DETAIL = 80  # a progress line's tool detail on the console; run.log keeps all of it

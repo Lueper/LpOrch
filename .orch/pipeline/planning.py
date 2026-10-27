@@ -38,7 +38,7 @@ async def PlanTask(task: Task, ctx: RunContext) -> None:
         return
     spec = AgentSpec(
         role="planner",
-        cwd=ctx.repoRoot if task.kind == "code" and ctx.repoRoot else ctx.projectDir,
+        cwd=task.codeDir or ctx.projectDir,  # code: its src/ folder, which CodeFolder made
         systemAppend=LoadPrompt("planner"),
         addDirs=task.refDirs,
         schema=PLAN_SCHEMA,

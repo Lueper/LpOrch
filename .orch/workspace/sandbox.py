@@ -1,8 +1,9 @@
-"""[sys] task workspaces: copies of the orchestrator's own files, diffs, 3-way apply, and automated checks;
-and the disposable copies of the whole project that [test] tasks run in.
+"""Task workspaces as plain file copies: [sys] sandboxes of the whole project, the src/ folder a [code] task works in
+with its base copy (and the temporary copies split parts work in), and the disposable project copies [test] tasks
+run in; diffs, 3-way apply, roll-back, and automated checks.
 
-Plain file copies plus `git merge-file` (which needs no repository), so [sys] tasks work
-whether or not the project is a git repo. SDK-free.
+Plain file copies plus `git merge-file` (which needs no repository), so no task kind needs the project to be a git
+repo. SDK-free.
 """
 from __future__ import annotations
 
@@ -17,68 +18,74 @@ from pathlib import Path
 
 from core.paths import IsOsMetadata
 
-# The system a [sys] task may change
-SCOPE_DIRS = (".orch", ".claude")
-# orch.toml: checked by preview. README.md documents this orchestrator, so a [sys] task keeps it in sync.
-# The launchers come in pairs: .bat for Windows, .sh for macOS/Linux
-SCOPE_FILES = (
-    "CLAUDE.md", "README.md", "TASKS.md", "orch.toml", "orch.bat", "orch-reset.bat", "orch.sh", "orch-reset.sh",
-)
-# Run artifacts, sandboxes, caches and local or secret files never enter a sandbox
-EXCLUDED_DIRS = {"runs", "worktrees", "__pycache__", ".pytest_cache", ".mypy_cache", ".venv"}
-EXCLUDED_FILES = {"settings.local.json"}
+# A workspace holds every file of its root except these. [sys] sandboxes are rooted at the project (the whole
+# project is in scope), [code] workspaces at their src/ folder.
+# Folders left out at any depth: git data, caches, virtual environments and installed packages
+EXCLUDED_DIRS = {".git", "__pycache__", ".pytest_cache", ".mypy_cache", ".venv", "venv", "node_modules"}
+# The orchestrator's run artifacts, the sandboxes themselves (made under .orch/worktrees/) and its record of the code
+# folders (written while a run lasts), from the root
+EXCLUDED_PATHS = (".orch/runs", ".orch/worktrees", ".orch/code_folders.json")
+# Local or secret files never enter a sandbox, and a sandbox never writes them back
+EXCLUDED_FILES = {".env", ".mcp.json", "settings.local.json"}
+SECRET_PREFIX = ".env."  # .env.local, .env.production, ... (.env.example is a template, not a secret)
 EXCLUDED_SUFFIXES = {".pyc", ".log"}
-# A [test] copy of the project leaves out git's own data and caches, and the orchestrator's run artifacts -
-# the copy itself is made under .orch/worktrees/
+# The orchestrator's own settings: the smoke test parses their JSON files (a project's own may be broken on purpose)
+SETTINGS_DIRS = (".orch", ".claude")
+# A [test] copy of the project leaves out git's own data and caches, and the orchestrator's run artifacts (EXCLUDED_PATHS)
 PROJECT_COPY_SKIPPED = {".git", "__pycache__", ".pytest_cache", ".mypy_cache"}
-ORCH_ARTIFACT_DIRS = (Path(".orch") / "runs", Path(".orch") / "worktrees")
 CHECK_TIMEOUT = 120  # seconds per built-in check
 VERIFY_TIMEOUT = 600  # seconds for a task's own "verify:" command
 MAX_CHECK_OUTPUT = 4000  # tail of a failed check kept for prompts
 
 
+def IsSecret(name: str) -> bool:
+    return name in EXCLUDED_FILES or (name.startswith(SECRET_PREFIX) and not name.endswith(".example"))
+
+
+def ExcludedDir(relative: str) -> bool:
+    """A folder no workspace descends into, by its posix path from the workspace root."""
+    return relative.rsplit("/", 1)[-1] in EXCLUDED_DIRS or relative in EXCLUDED_PATHS
+
+
 def InScope(relative: str) -> bool:
+    """Whether a file, by its posix path from the workspace root, belongs to the workspace."""
     parts = relative.split("/")
-    if len(parts) == 1:
-        return relative in SCOPE_FILES
-    if parts[0] not in SCOPE_DIRS or EXCLUDED_DIRS.intersection(parts[:-1]):
+    folders = ["/".join(parts[:index]) for index in range(1, len(parts))]
+    if relative in EXCLUDED_PATHS or any(ExcludedDir(folder) for folder in folders):
         return False
-    return parts[-1] not in EXCLUDED_FILES and Path(parts[-1]).suffix not in EXCLUDED_SUFFIXES
+    return not IsSecret(parts[-1]) and Path(parts[-1]).suffix not in EXCLUDED_SUFFIXES
 
 
-def WalkFiles(root: Path):
-    """Every file under root as (relative posix path, path), skipping excluded folders and file-manager metadata
-    (a "._x.py" AppleDouble file would otherwise be compiled by the smoke test)."""
-    for folder, dirs, names in os.walk(root):
-        dirs[:] = [name for name in dirs if name not in EXCLUDED_DIRS]
+def WalkFiles(root: Path, start: str = ""):
+    """Every file under root/start as (posix path from root, path), skipping excluded folders and file-manager
+    metadata (a "._x.py" AppleDouble file would otherwise be compiled by the smoke test)."""
+    for folder, dirs, names in os.walk(root / start):
+        here = Path(folder).relative_to(root).as_posix()
+        dirs[:] = [name for name in dirs if not ExcludedDir(f"{here}/{name}".removeprefix("./"))]
         for name in (name for name in names if not IsOsMetadata(name)):
             path = Path(folder) / name
             yield path.relative_to(root).as_posix(), path
 
 
-def SystemFiles(root: Path) -> dict[str, Path]:
+def WorkspaceFiles(root: Path) -> dict[str, Path]:
     return {relative: path for relative, path in WalkFiles(root) if InScope(relative)}
 
 
-def CreateSnapshot(projectDir: Path, dest: Path) -> Path:
-    """Copy the project's system files to dest: the base every sandbox of this run starts from."""
-    for relative in SystemFiles(projectDir):
+def CopyTree(source: Path, dest: Path) -> Path:
+    """Copy the workspace files of source to dest: a run's [sys] snapshot of the project, a sandbox, a [code]
+    folder's base, a checkpoint."""
+    for relative, path in WorkspaceFiles(source).items():
         target = dest / relative
         target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(projectDir / relative, target)
+        shutil.copy2(path, target)
     dest.mkdir(parents=True, exist_ok=True)
-    return dest
-
-
-def CopyTree(source: Path, dest: Path) -> Path:
-    shutil.copytree(source, dest, ignore=shutil.ignore_patterns(*EXCLUDED_DIRS))
     return dest
 
 
 def CopyProject(projectDir: Path, dest: Path) -> dict[str, tuple[int, int]]:
     """Copy the project as it is now, uncommitted changes included, for a [test] task to work in; returns the copy's
     files with their size and modification time, which ChangedFiles compares against."""
-    skipped = {(projectDir / relative).resolve() for relative in ORCH_ARTIFACT_DIRS}
+    skipped = {(projectDir / relative).resolve() for relative in EXCLUDED_PATHS}
 
     def Ignore(folder: str, names: list[str]) -> list[str]:
         here = Path(folder).resolve()
@@ -109,8 +116,8 @@ def ChangedFiles(root: Path, stamps: dict[str, tuple[int, int]]) -> list[tuple[s
 
 
 def Changes(base: Path, workspace: Path) -> list[tuple[str, str]]:
-    """(status, path) for system files the workspace added (A), modified (M) or deleted (D) against base."""
-    before, after = SystemFiles(base), SystemFiles(workspace)
+    """(status, path) for workspace files the workspace added (A), modified (M) or deleted (D) against base."""
+    before, after = WorkspaceFiles(base), WorkspaceFiles(workspace)
     changes = [("D", name) for name in before if name not in after]
     for name, path in after.items():
         if name not in before:
@@ -121,7 +128,7 @@ def Changes(base: Path, workspace: Path) -> list[tuple[str, str]]:
 
 
 def OutOfScope(workspace: Path) -> list[str]:
-    """Files a worker created outside the system scope; they are never applied."""
+    """Files a worker created that are no workspace files (secrets, logs); they are never applied."""
     return sorted(relative for relative, _ in WalkFiles(workspace) if not InScope(relative))
 
 
@@ -200,16 +207,25 @@ def SaveChangedFiles(workspace: Path, names: list[str], dest: Path) -> None:
             shutil.copy2(workspace / name, dest / name)
 
 
-def Checkpoint(workspace: Path) -> Path:
-    """Copy the workspace before an agent edits it again, so a failed attempt can be rolled back."""
-    checkpoint = workspace.with_name(f"{workspace.name}.checkpoint")
-    shutil.rmtree(checkpoint, ignore_errors=True)
-    return CopyTree(workspace, checkpoint)
+def Checkpoint(workspace: Path, dest: Path) -> Path:
+    """Copy the workspace to dest before an agent edits it again, so a failed attempt can be rolled back. dest lies
+    outside the workspace: a [code] task's workspace is its folder in src/."""
+    shutil.rmtree(dest, ignore_errors=True)
+    return CopyTree(workspace, dest)
 
 
-def Restore(workspace: Path, checkpoint: Path) -> None:
-    shutil.rmtree(workspace, ignore_errors=True)
-    CopyTree(checkpoint, workspace)
+def Restore(workspace: Path, checkpoint: Path) -> list[str]:
+    """Bring the workspace files back to checkpoint (or a base): files added since are deleted, changed and deleted
+    ones copied back. Only workspace files are touched, so a src/ folder keeps its caches and virtual environment.
+    Returns the files restored."""
+    changes = Changes(checkpoint, workspace)
+    for status, name in changes:
+        if status == "A":
+            (workspace / name).unlink(missing_ok=True)
+            continue
+        (workspace / name).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(checkpoint / name, workspace / name)
+    return [name for _, name in changes]
 
 
 # ---------- automated checks ----------
@@ -236,7 +252,9 @@ def SmokeTest(root: Path) -> list[tuple[bool, str]]:
     """Compile and import every orchestrator module in root (packages included), run its preview, then parse its JSON
     settings."""
     orch = root / ".orch"
-    sources = sorted(relative for relative, _ in WalkFiles(orch) if relative.endswith(".py"))  # skips runs/, caches
+    sources = sorted(  # skips runs/, worktrees/ and caches
+        relative.removeprefix(".orch/") for relative, _ in WalkFiles(root, ".orch") if relative.endswith(".py")
+    )
     imports = "; ".join(f"import {ModuleName(relative)}" for relative in sources)
     steps = [
         ("compile", [sys.executable, "-m", "py_compile", *(str(orch / relative) for relative in sources)]),
@@ -249,7 +267,11 @@ def SmokeTest(root: Path) -> list[tuple[bool, str]]:
         results.append(RunStep(name, command, root, CHECK_TIMEOUT))
         if not results[-1][0]:
             break
-    return results + [CheckJson(relative, path) for relative, path in SystemFiles(root).items() if path.suffix == ".json"]
+    settings = [
+        (relative, path) for relative, path in WorkspaceFiles(root).items()
+        if path.suffix == ".json" and relative.split("/", 1)[0] in SETTINGS_DIRS
+    ]
+    return results + [CheckJson(relative, path) for relative, path in settings]
 
 
 def ModuleName(relative: str) -> str:

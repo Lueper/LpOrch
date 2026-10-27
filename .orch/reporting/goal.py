@@ -17,7 +17,7 @@ from agents.runner import AgentSpec, LoadPrompt, RunAgent, WriteText
 from core.paths import REPORT_DIR_NAME, DocPath, SanitizeTitle
 from core.runcontext import RunContext
 from core.tasks import (
-    STATUS_DONE, STATUS_FAILED, STATUS_PENDING, STATUS_RUNNING, FollowUp, OpenTodos, Task, TodoBlockers,
+    RUN_STATUSES, STATUS_DONE, STATUS_FAILED, STATUS_PENDING, STATUS_RUNNING, FollowUp, OpenTodos, Task, TodoBlockers,
 )
 
 GOAL_TITLE = "목표 보고"  # in the file name, before the origin's title: report/[T01]_<YYMMDD>_목표_보고_<title>.md
@@ -47,9 +47,9 @@ class GoalReport:
 
 
 def StalledChains(ran: list[Task], allTasks: list[Task], added: list[Added]) -> list[GoalChain]:
-    """The chains this run moved that cannot go on by themselves now: every task left is done or failed, or waits on
-    a person's to-do. A chain with something still runnable - a pending task, a follow-up just added - goes on in a
-    later run and gets its report then; a task without follow-ups is no chain."""
+    """The chains this run moved that cannot go on by themselves now: every task left is done, or waits on a person's
+    to-do. A chain with something still runnable - a pending task, a failed one (it runs again), a follow-up just
+    added - goes on in a later run and gets its report then; a task without follow-ups is no chain."""
     byId = {task.id: task for task in allTasks}
     chains = []
     for originId in dict.fromkeys(task.origin or task.id for task in ran):
@@ -63,7 +63,7 @@ def StalledChains(ran: list[Task], allTasks: list[Task], added: list[Added]) -> 
         waiting = [f"{origin.id}: {item}" for item in OpenTodos(origin)]
         for task in tasks:
             waiting += [f"{task.id}: {item}" for item in OpenTodos(task)] if task.status == STATUS_DONE else []
-        runnable = [task for task in tasks if task.status == STATUS_PENDING and not TodoBlockers(task)]
+        runnable = [task for task in tasks if task.status in RUN_STATUSES and not TodoBlockers(task)]
         runnable += [item for item in new if not OpenTodos(item[2]) and not OpenTodos(origin)]
         if not runnable:
             chains.append(GoalChain(origin, tasks, new, list(dict.fromkeys(waiting))))

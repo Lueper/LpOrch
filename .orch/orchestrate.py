@@ -1,6 +1,7 @@
 """Agent orchestrator: every TASKS.md task runs on its own - work -> fresh review -> revision -> result.
 "mode: full" tasks use the multi-agent pipeline (plan -> parallel parts -> ring review -> merge -> integration review).
-Tasks with "after:" wait for those tasks; [sys] tasks change the orchestrator itself and are applied at the end.
+Tasks with "after:" wait for those tasks; [code] tasks work in their origin goal's folder under src/ (no git);
+[sys] tasks may change any project file, the orchestrator itself included, and are applied at the end.
 A task whose agents asked for follow-up work gets those tasks appended to the task list as new pending ones, tied to
 the task a person wrote that the chain started from ("ref: T01 (origin)") and limited in depth and number per origin.
 What only a person can do becomes a "todo:" line under its task, and the tasks built on it wait until it is done;
@@ -11,7 +12,7 @@ for every kind but doc, whose result is its document in doc/, the task list's re
 
 Lives in <project>/.orch/ and always works on <project>, the folder that contains .orch/.
 Usage (via the launcher at the project root: orch.bat on Windows, orch.sh on macOS/Linux):
-    orch                 run the pending tasks in TASKS.md      (PowerShell: .\\orch, macOS/Linux: ./orch.sh)
+    orch                 run the pending and failed tasks in TASKS.md   (PowerShell: .\\orch, macOS/Linux: ./orch.sh)
     orch preview         show tasks, reviewer pairs and the agent count without running anything
     orch 60              run every 60 minutes until Ctrl+C - each run is a fresh process (Watch)
 Options: [--max-parallel N] [--max-rounds N] [--budget-per-agent USD] [--max-turns N]
@@ -22,7 +23,7 @@ Their defaults, and the provider and model of each agent role, come from orch.to
 
 Packages under .orch/, each importing only the ones listed before it:
     core/       settings, provider registry, task model, the task list (TASKS.md or Notion), refs, run state (SDK-free)
-    workspace/  git worktrees for code tasks; sandboxes and automated checks for sys tasks
+    workspace/  file-copy workspaces of code, sys and test tasks, and automated checks (gitops.py: unused git helpers)
     agents/     one agent call on its role's provider: runner.py (provider-neutral), claude.py, gemini.py
     reporting/  review state and gating, summary.md, upstream history, progress reports
     pipeline/   one task's plan -> work -> review -> merge
@@ -49,14 +50,14 @@ from agents.runner import CONSOLE_TEXT
 from core.capacity import AutoParallel
 from core.config import TASK_SOURCES, AgentSummary, LoadConfig, OrchConfig, Problems, ProvidersInUse
 from core.context import RefLabel, RefTasks, ResolveRefs, ResultFiles, StaleNotices
-from core.paths import PROJECT_ROOT, RUNS_DIR, SKILL_DIR, WORKTREES_DIR
+from core.paths import PROJECT_ROOT, RUNS_DIR, SKILL_DIR, SRC_DIR_NAME, WORKTREES_DIR, CodeOrigin, RecordedCodeFolder
 from core.providers import PROVIDER_SPECS, PROVIDERS
 from core.runcontext import RunContext
 from core.taskfile import DIRECTIVE_PATTERN, TASK_REF_PATTERN, AddDetail, LinkDependencies, RefEntries
 from core.tasks import (
-    MAX_FOLLOWUPS, MAX_PARTS, MODE_FULL, MODE_STANDARD, ORIGIN_MARKER, STATUS_DONE, STATUS_FAILED, STATUS_PENDING,
-    STATUS_RUNNING, FollowUp, FollowUpDepth, FollowUpsOf, Task, TaskFileError, TaskId, TitleKey, TodoBlockers,
-    TodosAsked,
+    MAX_FOLLOWUPS, MAX_PARTS, MODE_FULL, MODE_STANDARD, ORIGIN_MARKER, RUN_STATUSES, STATUS_DONE, STATUS_FAILED,
+    STATUS_PENDING, STATUS_RUNNING, FollowUp, FollowUpDepth, FollowUpsOf, Task, TaskFileError, TaskId, TitleKey,
+    TodoBlockers, TodosAsked,
 )
 from core.tasksource import CreateTaskSource, TaskSource
 from pipeline.merge import ApplySystemTasks
@@ -64,8 +65,7 @@ from pipeline.taskflow import RunTask
 from reporting.goal import NOT_ADDED_NOTE, Added, GoalReport, StalledChains, WriteGoalReports
 from reporting.progress import WriteProgressReports
 from reporting.report import WriteRunSummary
-from workspace import gitops
-from workspace.sandbox import CreateSnapshot
+from workspace.sandbox import CopyTree
 
 ROLE_SKILL_DIR = SKILL_DIR / "develop"
 MAX_LISTED_REFS = 5  # preview lists this many ref entries per task
@@ -174,16 +174,16 @@ def PrintPlan(tasks: list[Task], source: TaskSource, config: OrchConfig, paralle
         for note in PROVIDER_SPECS[name].notes:
             print(f"{name}: {note}")
     if any(task.kind == "code" for task in tasks):
-        repo = gitops.ResolveRepo(PROJECT_ROOT)
-        print(f"git: {repo[0]} @ {repo[1][:8]}" if repo else "git: NOT a repo with commits - code tasks will fail")
-        if repo:  # what the results are merged into and staged over, one after another
-            print("git: code tasks start from HEAD plus its uncommitted changes to tracked files; their results are"
-                  " merged one after another and staged in the working tree")
+        print("code: worked on in the origin goal's folder under src/ - a project name an agent gives the goal, recorded"
+              " in .orch/code_folders.json - (no git), one task per folder at a time; split parts work in copies merged"
+              " into it; rolled back unless checks and reviews pass")
     if any(task.kind == "sys" for task in tasks):
-        print("sys: edited in sandbox copies; applied to the project when the run ends if checks and reviews pass")
+        print("sys: any project file, edited in sandbox copies; applied to the project when the run ends if checks and"
+              " reviews pass")
     for task in tasks:
         role = f":{task.role}" if task.role else ""
-        print(f"  {task.id} [{task.kind}{role}] {task.title}")
+        again = " (failed before - runs again)" if task.status == STATUS_FAILED else ""
+        print(f"  {task.id} [{task.kind}{role}] {task.title}{again}")
         for label, value in TaskSettings(task):
             print(f"      {label}: {value}")
         for detail in task.details:
@@ -195,9 +195,13 @@ def TaskSettings(task: Task) -> list[tuple[str, str]]:
     origin = next((up for up in task.upstream if up.id == task.origin), None)
     if origin:
         settings.append(("origin", f"{origin.id} {origin.title} (follow-up generation {FollowUpDepth(task)})"))
+    if task.kind == "code":
+        goal = CodeOrigin(task)
+        name = RecordedCodeFolder(goal, PROJECT_ROOT) or f"<named by an agent when {goal.id}'s goal first runs code>"
+        settings.append(("folder", f"{SRC_DIR_NAME}/{name}"))
     settings += [("todo", item) for item in task.todoOpen] + [("todo done", item) for item in task.todoDone]
     if task.upstream:
-        waits = [f"{up.id} ({'this run' if up.status == STATUS_PENDING else StatusName(up.status)})" for up in task.upstream]
+        waits = [f"{up.id} ({'this run' if up.status in RUN_STATUSES else StatusName(up.status)})" for up in task.upstream]
         settings.append(("after", ", ".join(waits)))
     refs = [TaskRefLabel(up) for up in RefTasks(task)]
     refs += [RefLabel(path, PROJECT_ROOT) for path in task.refFiles] + task.refUrls
@@ -215,7 +219,7 @@ def TaskSettings(task: Task) -> list[tuple[str, str]]:
 
 def TaskRefLabel(up: Task) -> str:
     """"ref: Txx" as preview shows it: the result file, or that it comes from this run."""
-    if up.status == STATUS_PENDING:
+    if up.status in RUN_STATUSES:
         return f"{up.id} result (this run)"
     files = ", ".join(RefLabel(path, PROJECT_ROOT) for path in ResultFiles(up, PROJECT_ROOT))
     history = f", reviews from run {up.resultRun}" if up.resultRun else ""
@@ -224,7 +228,7 @@ def TaskRefLabel(up: Task) -> str:
 
 def StatusName(status: str) -> str:
     blocked = " - this task will be blocked"
-    names = {STATUS_DONE: "done", STATUS_FAILED: f"failed{blocked}", STATUS_RUNNING: f"stuck running{blocked}"}
+    names = {STATUS_DONE: "done", STATUS_RUNNING: f"stuck running{blocked}"}  # a failed one runs again: "this run"
     return names.get(status, status)
 
 
@@ -254,36 +258,18 @@ def CreateLogger(runDir: Path) -> logging.Logger:
     return logger
 
 
-def CreateContext(config: OrchConfig, parallel: int, snapshot: bool) -> RunContext:
-    """The run's state. With snapshot (the run has code tasks), code tasks start from HEAD plus the working tree's
-    uncommitted changes, so results a person has not committed yet are their base instead of a conflict."""
+def CreateContext(config: OrchConfig, parallel: int) -> RunContext:
     runId = datetime.now().strftime("%Y%m%d-%H%M%S")
     runDir = RUNS_DIR / runId
     runDir.mkdir(parents=True)
-    repo = gitops.ResolveRepo(PROJECT_ROOT)
-    repoRoot, baseCommit = repo if repo else (None, None)
-    log = CreateLogger(runDir)
-    if repo and snapshot:
-        try:
-            base, uncommitted = gitops.SnapshotCommit(repoRoot)
-        except gitops.GitError as error:  # HEAD alone is the old behavior: uncommitted files then block results
-            log.warning("git: no snapshot of the uncommitted changes, code tasks start from HEAD: %s", error)
-        else:
-            if uncommitted:
-                log.info("git: code tasks start from HEAD %s plus its uncommitted changes (snapshot %s)",
-                         baseCommit[:8], base[:8])
-            baseCommit = base
     return RunContext(
         runId=runId,
         runDir=runDir,
         projectDir=PROJECT_ROOT,
-        repoRoot=repoRoot,
         worktreeDir=WORKTREES_DIR / runId,
-        baseCommit=baseCommit,
         config=config,
-        log=log,
+        log=CreateLogger(runDir),
         semaphore=asyncio.Semaphore(parallel),
-        appliedCommit=baseCommit,
     )
 
 
@@ -302,9 +288,10 @@ def FinalStatus(task: Task) -> str:
 
 
 def SettleEarlierTasks(allTasks: list[Task]) -> None:
-    """Tasks outside this run count as finished for "after:" waits: done ones succeeded, the others did not."""
+    """Tasks outside this run count as finished for "after:" waits: done ones succeeded, the others did not.
+    Pending and failed tasks are this run's (or wait on a person's to-do), so they are left unfinished."""
     for task in allTasks:
-        if task.status == STATUS_PENDING:
+        if task.status in RUN_STATUSES:
             continue
         task.finished = True
         if task.status != STATUS_DONE:
@@ -313,8 +300,9 @@ def SettleEarlierTasks(allTasks: list[Task]) -> None:
 
 
 def Runnable(task: Task) -> bool:
-    """Whether a pending task can run now: each "after:" task is done, or pending and runnable itself."""
-    return all(up.status == STATUS_DONE or (up.status == STATUS_PENDING and Runnable(up)) for up in task.upstream)
+    """Whether a pending or failed task can run now: each "after:" task is done, or pending or failed and runnable
+    itself."""
+    return all(up.status == STATUS_DONE or (up.status in RUN_STATUSES and Runnable(up)) for up in task.upstream)
 
 
 def Watch(minutes: int, argv: list[str]) -> int:
@@ -347,13 +335,9 @@ def RunCycle(command: list[str]) -> int:
         raise
 
 
-def RemoveWorkspaces(tasks: list[Task], ctx: RunContext) -> None:
-    for part in (part for task in tasks for part in task.parts):  # branches and stashes survive
-        if part.kind == "code" and part.worktree:
-            gitops.RemoveWorktree(ctx.repoRoot, part.worktree)
-    if ctx.applyWorktree:  # its branch orch/<run>/applied stays: what the run staged, merge by merge
-        gitops.RemoveWorktree(ctx.repoRoot, ctx.applyWorktree)
-    shutil.rmtree(ctx.worktreeDir, ignore_errors=True)  # sys sandboxes and the system snapshot
+def RemoveWorkspaces(ctx: RunContext) -> None:
+    # sys sandboxes and the project snapshot, code bases and split parts' copies, test copies, checkpoints
+    shutil.rmtree(ctx.worktreeDir, ignore_errors=True)
 
 
 def RecordResults(tasks: list[Task], log: logging.Logger, source: TaskSource) -> None:
@@ -492,7 +476,7 @@ def AddFollowUpTasks(
 ) -> list[Added]:
     """Append the follow-up tasks this run's agents asked for to the task list, as new pending tasks; returns them.
 
-    Only tasks that succeeded contribute: a failed or blocked task goes back to pending and runs again, which
+    Only tasks that succeeded contribute: a failed or blocked task runs again in the next run, which
     would propose the same follow-ups a second time. A title already in the task list is skipped for the same
     reason, so re-running a task does not pile up duplicates.
     Each follow-up is tied to its chain: "ref: <origin> (origin)" names the task a person wrote that the chain started
@@ -584,7 +568,7 @@ def AddNewTasks(
 async def RunPipeline(
     tasks: list[Task], allTasks: list[Task], source: TaskSource, config: OrchConfig, parallel: int, reason: str
 ) -> int:
-    ctx = CreateContext(config, parallel, snapshot=any(task.kind == "code" for task in tasks))
+    ctx = CreateContext(config, parallel)
     ctx.nextTaskNumber = source.NextNumber()  # [task] workers number the tasks they write from here
     ctx.log.info("%d task(s), up to %d concurrent agent(s) (%s)", len(tasks), parallel, reason)
     for line in AgentSummary(config):  # run.log records which provider/model each role ran on
@@ -592,8 +576,8 @@ async def RunPipeline(
     ctx.log.info("task list: %s", source.label)
     SettleEarlierTasks(allTasks)
     MarkTasks(tasks, lambda task: STATUS_RUNNING, ctx.log, source)
-    if any(task.kind == "sys" for task in tasks):
-        ctx.systemBase = CreateSnapshot(PROJECT_ROOT, ctx.worktreeDir / "_base")
+    if any(task.kind == "sys" for task in tasks):  # the whole project but git data, run artifacts, caches, secrets
+        ctx.systemBase = CopyTree(PROJECT_ROOT, ctx.worktreeDir / "_base")
     completed = False
     goals: list[GoalReport] = []
     try:
@@ -620,7 +604,7 @@ async def RunPipeline(
         if config.goalReports:  # after the progress reports: a goal report quotes them
             goals = await WriteGoalReports(StalledChains(tasks, allTasks, added), ctx)
     finally:
-        RemoveWorkspaces(tasks, ctx)
+        RemoveWorkspaces(ctx)
         # Aborted runs (and sys tasks never applied) go back to pending so the next run picks them up again
         MarkTasks([task for task in tasks if task.status == STATUS_RUNNING], lambda task: STATUS_PENDING, ctx.log, source)
         RecordResults(tasks, ctx.log, source)
@@ -652,7 +636,8 @@ def Main(argv: list[str] | None = None) -> int:
         return 2
     for warning in source.Warnings():  # a typo in a task line or row would otherwise drop the task silently
         print(f"warning: {warning}")
-    pending = [task for task in allTasks if task.status == STATUS_PENDING]
+    # A failed task ([!]) runs again like a pending one; a "todo:" line under it holds it back
+    pending = [task for task in allTasks if task.status in RUN_STATUSES]
     # A missing ref stops the run: the agent would otherwise guess at another file
     errors = LinkDependencies(allTasks) + [error for task in pending for error in ResolveRefs(task, PROJECT_ROOT)]
     for error in errors:
@@ -662,7 +647,7 @@ def Main(argv: list[str] | None = None) -> int:
     for notice in StaleNotices(allTasks, PROJECT_ROOT):  # informational: rebuilding is the user's call
         print(f"notice: {notice}")
     if not pending:
-        print(f"No pending tasks in {source.label}")
+        print(f"No pending or failed tasks in {source.label}")
         return 0
     # A "todo:" left for a person holds back its task and every task built on it: they do not start at all
     waiting = {task.id: blockers for task in pending if (blockers := TodoBlockers(task))}

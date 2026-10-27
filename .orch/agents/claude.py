@@ -1,8 +1,11 @@
 """Claude backend: one agent call through claude_agent_sdk, which drives the Claude Code CLI.
 
 - tools: runner.ROLE_TOOLS as they are (Claude Code's own names), pre-approved; write roles accept edits
+- write scope: a write role's Edit and Write outside its workspace (its cwd) are denied by a PreToolUse hook
+  (gemini_guard.OutsideWriteRoot, the rule Gemini agents follow too)
 - role prompt: appended to the claude_code system prompt preset
 - project rules and guards: setting_sources=["project"] - CLAUDE.md, .claude/settings.json deny rules and hooks
+  (found in the cwd or its nearest parent that has a .claude/ folder, so a src/ folder gets the project's)
 - structured output: the SDK's json_schema output format
 - limits: budget_per_agent and max_turns per call; [claude] max_retries goes to the CLI as CLAUDE_CODE_MAX_RETRIES
 - token use: the result message's usage totals, checked against every API response's usage, into runner.TokenUsage
@@ -23,6 +26,7 @@ import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from agents.gemini_guard import OutsideWriteRoot
 from agents.runner import ROLE_TOOLS, WRITE_ROLES, AgentResult, AgentSpec, LogToolUse, TokenUsage
 from core.runcontext import RunContext
 
@@ -32,6 +36,7 @@ if TYPE_CHECKING:
 # Errors worth another attempt (runner.RunAgent): the connection or the API broke off, not the request itself.
 # Rate limits (429) were already retried by the CLI; auth, budget and turn caps would fail the same way again
 TRANSIENT_ERROR = re.compile(r"API Error: (?:5\d\d\b|Connection|Request timed out)|overloaded", re.IGNORECASE)
+FILE_WRITE_TOOLS = "Edit|Write|MultiEdit|NotebookEdit"  # the tools WriteScopeHooks checks
 
 
 async def Run(label: str, prompt: str, spec: AgentSpec, ctx: RunContext, model: str | None) -> AgentResult:
@@ -93,6 +98,7 @@ def Options(spec: AgentSpec, ctx: RunContext, label: str, model: str | None) -> 
         strict_mcp_config=True,  # skip .mcp.json so parallel agents don't each spawn npx servers
         mcp_servers={},
         add_dirs=[str(path) for path in spec.addDirs],
+        hooks=WriteScopeHooks(spec),
         resume=spec.resume,
         fork_session=spec.fork,
         output_format={"type": "json_schema", "schema": spec.schema} if spec.schema else None,
@@ -102,6 +108,23 @@ def Options(spec: AgentSpec, ctx: RunContext, label: str, model: str | None) -> 
         cli_path=CliPath(settings.cliPath),
         env=Env(settings.maxRetries),
     )
+
+
+def WriteScopeHooks(spec: AgentSpec) -> dict | None:
+    """A write role changes files only inside its workspace - its cwd: a src/ folder, a sandbox, a copy. Edit and
+    Write elsewhere are denied; the pre-approved tools would otherwise write anywhere."""
+    if spec.role not in WRITE_ROLES:
+        return None
+    from claude_agent_sdk import HookMatcher  # lazy: see the module docstring
+
+    async def Check(inputData: dict, toolUseId: str | None, context) -> dict:
+        reason = OutsideWriteRoot(inputData.get("tool_input") or {}, spec.cwd, spec.cwd)
+        if reason is None:
+            return {}
+        decision = {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": reason}
+        return {"hookSpecificOutput": decision}
+
+    return {"PreToolUse": [HookMatcher(matcher=FILE_WRITE_TOOLS, hooks=[Check])]}
 
 
 def Env(retries: int | None) -> dict[str, str]:

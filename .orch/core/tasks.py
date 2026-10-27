@@ -16,8 +16,9 @@ STATUS_PENDING = " "
 STATUS_RUNNING = "~"
 STATUS_DONE = "x"
 STATUS_FAILED = "!"
-# doc: a document in doc/; code: staged changes; sys: the orchestrator's own files; test: a run in a disposable copy
-# of the project that leaves only its report; task: new tasks written to the task list
+RUN_STATUSES = (STATUS_PENDING, STATUS_FAILED)  # what a run picks up: a failed task runs again like a pending one
+# doc: a document in doc/; code: files in its origin's folder under src/; sys: any file of the project; test: a run in
+# a disposable copy of the project that leaves only its report; task: new tasks written to the task list
 TASK_KINDS = ("doc", "code", "sys", "test", "task")
 SINGLE_PART_KINDS = ("test", "task")  # no "mode: full": a test or a task list is one agent's single result
 # standard: one agent, one fresh review, revision, verify only after CRITICAL findings
@@ -30,7 +31,7 @@ MAX_WRITTEN_TASKS = 20  # tasks one [task] task may write: planning is its job
 ORIGIN_MARKER = "(origin)"  # "ref: T01 (origin)": the task a follow-up chain started from, i.e. the goal it serves
 DEFAULT_DOC_LANG = "Korean"  # doc deliverables; "lang:" overrides per task
 LANG_NAMES = {"ko": "Korean", "kr": "Korean", "en": "English", "ja": "Japanese"}
-SYS_APPLIED_PREFIX = "applied to the project: "  # a sys task's changed files: its result until its report replaces it
+APPLIED_PREFIX = "applied to the project: "  # a sys or code task's changed files: its result until its report replaces it
 
 
 class TaskFileError(Exception):
@@ -102,11 +103,11 @@ class Task:
     # To-dos for a person found this run: the merger's, integration fixer's or [task] writer's, and the orchestrator's
     # own (a code result it could not apply); written under the task as "todo:" lines when the run ends
     todoAsked: list[str] = field(default_factory=list)
-    gitBase: str | None = None  # code: the commit its worktrees start from (the run's applied code results so far)
+    codeDir: Path | None = None  # code: its folder under src/ (paths.CodeDir), where the result is kept
     revisions: int = 0
     checkOk: bool | None = None  # automated checks on the integrated result; None = not run
     checkOutput: str = ""
-    baseDir: Path | None = None  # sys: the snapshot this task's sandboxes start from
+    baseDir: Path | None = None  # sys: the snapshot its sandboxes start from; code: its folder as the task found it
     workspace: Path | None = None  # sys: integrated change, applied when the run ends
     costUsd: float = 0.0  # task-level agents: planner, merger, namer, integration review/fix
     error: str | None = None
@@ -152,9 +153,9 @@ class Part:
     brief: str
     # Runtime state filled in by the pipeline
     workCwd: Path | None = None
-    worktree: Path | None = None  # code: git worktree; sys: sandbox copy; test: disposable copy of the project
+    # code: its src/ folder, or a temporary copy of it for a split part; sys: sandbox copy; test: copy of the project
+    worktree: Path | None = None
     copyStamps: dict[str, tuple[int, int]] = field(default_factory=dict)  # test: the copy's files as made (size, mtime)
-    branch: str | None = None
     sessionId: str | None = None
     contextTokens: int = 0  # peak context of that worker session; 0 = not reported (the fix then resumes it)
     costUsd: float = 0.0
@@ -203,8 +204,9 @@ def OpenTodos(task: Task) -> list[str]:
 
 
 def TodoBlockers(task: Task, seen: set[str] | None = None) -> list[str]:
-    """"Txx: <to-do>" for each to-do a person must do before a pending task can run: its own open "todo:" lines and
-    those of the tasks it builds on - a done one's directly, a pending one's with everything it waits for in turn."""
+    """"Txx: <to-do>" for each to-do a person must do before a pending or failed task can run: its own open "todo:"
+    lines and those of the tasks it builds on - a done one's directly, a pending or failed one's (it runs again) with
+    everything it waits for in turn."""
     seen = set() if seen is None else seen
     if task.id in seen:
         return []
@@ -213,7 +215,7 @@ def TodoBlockers(task: Task, seen: set[str] | None = None) -> list[str]:
     for up in task.upstream:
         if up.status == STATUS_DONE:
             blockers += [f"{up.id}: {item}" for item in up.todoOpen]
-        elif up.status == STATUS_PENDING:
+        elif up.status in RUN_STATUSES:
             blockers += TodoBlockers(up, seen)
     return list(dict.fromkeys(blockers))
 

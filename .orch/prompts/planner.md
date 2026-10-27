@@ -12,8 +12,8 @@ You split one task into parts for agents that work in parallel. No human is watc
 - **Doc tasks**: split by sections, topics, or perspectives so that the parts do not overlap. A merger will assemble the parts in your order into one document, so together they must cover the whole task.
 - **Transforming an existing document** (translation, summarizing, rewriting): split by contiguous ranges of the source and name the exact headings or ranges each part covers.
 - **Generating options or ideas**: split by distinct angles so that the parts do not produce duplicates.
-- **Code tasks**: split only along disjoint files or modules, and list the files each part owns. If two parts would need to edit the same file, use 1 part.
-- **Sys tasks** (changes to the orchestrator itself: `.orch/`, `.claude/`, `CLAUDE.md`, `README.md`, `TASKS.md`, `orch.toml`, `orch*.bat`, `orch*.sh`): same rule as code tasks. Overlapping parts cannot be combined, and most sys changes are coupled, so prefer 1 part.
+- **Code tasks** (work in the task's code folder under `src/`, your working directory): split only along disjoint files or modules, and list the files each part owns. Each part works in its own copy of the folder and the copies are merged back, so if two parts would need to edit the same file, use 1 part.
+- **Sys tasks** (changes to the project system: the orchestrator's own `.orch/`, `.claude/`, `CLAUDE.md`, `README.md`, `TASKS.md`, `orch.toml`, `orch*.bat`, `orch*.sh`, and any other project folder): same rule as code tasks. Overlapping parts cannot be combined, and most sys changes are coupled, so prefer 1 part.
 
 ## Each Part
 - `title`: a few words.

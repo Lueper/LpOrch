@@ -5,7 +5,8 @@ AgentResult.
 - role prompt: the CLI cannot append to its system prompt, so it opens the first message of every new session
 - project rules, turn cap and guards: user settings in a per-run GEMINI_CLI_HOME (the CLI skips system settings
   files in folders an administrator does not own) - the user's own settings, plus CLAUDE.md as a context file,
-  max_turns, and gemini_guard.py before write and shell calls (the project's Claude Code hooks and deny rules).
+  max_turns, and gemini_guard.py before write and shell calls (the project's Claude Code hooks and deny rules, and
+  a write role's scope: file writes only inside its workspace, named in the process env as WRITE_ROOT_ENV).
   Sessions live in that home too, apart from the user's own; the API key comes from the OS keychain or env vars.
 - structured output: spec.schema asked for in the prompt, parsed from the reply, asked again once when it is not
   valid JSON
@@ -26,7 +27,8 @@ import shutil
 import sys
 from pathlib import Path
 
-from agents.runner import ROLE_TOOLS, AgentResult, AgentSpec, LogToolUse, WriteText
+from agents.gemini_guard import WRITE_ROOT_ENV
+from agents.runner import ROLE_TOOLS, WRITE_ROLES, AgentResult, AgentSpec, LogToolUse, WriteText
 from core.runcontext import RunContext
 
 GUARD_SCRIPT = Path(__file__).resolve().parent / "gemini_guard.py"
@@ -127,13 +129,19 @@ def ExtractJson(text: str, schema: dict) -> dict | None:
 
 # ---------- process ----------
 
+def WriteRoot(spec: AgentSpec) -> dict[str, str]:
+    """A write role's workspace for gemini_guard.py, which the CLI runs with this process's environment: its file
+    writes stay inside it. Without the variable (read-only roles have no write tools) nothing is checked."""
+    return {WRITE_ROOT_ENV: str(spec.cwd)} if spec.role in WRITE_ROLES else {}
+
+
 async def RunProcess(label: str, command: tuple[str, ...], prompt: str, spec: AgentSpec, ctx: RunContext,
                      model: str | None, sessionFile: Path | None) -> AgentResult:
     process = await asyncio.create_subprocess_exec(
         *command,
         *Arguments(spec, ctx, model, sessionFile),
         cwd=str(spec.cwd),
-        env={**os.environ, "GEMINI_CLI_HOME": str(GeminiHome(ctx)), "NO_COLOR": "1"},
+        env={**os.environ, "GEMINI_CLI_HOME": str(GeminiHome(ctx)), "NO_COLOR": "1", **WriteRoot(spec)},
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,

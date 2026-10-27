@@ -17,7 +17,8 @@ flowchart LR
 
 - **병렬 실행** — 작업 목록의 각 항목이 독립된 Task가 되어 동시에 처리됨 (`after:`로 지정한 선행 Task가 있으면 대기). 동시 실행 개수는 CPU/메모리 기준으로 자동 결정됨
 - **교차 리뷰** — 작업을 수행한 에이전트 대신 새 에이전트가 리뷰를 담당해 CRITICAL/WARNING을 판정하고 필요한 수정은 원 작업자가 이어서(resume) 반영함. 단, 작업 세션의 context가 60k token을 넘었고 CRITICAL이 없으면 새 세션이 작업 요약·diff 위치만 받아 수정함. 긴 세션은 요청마다 context 전체를 다시 읽어 비용이 큼 (`phases.FRESH_FIX_CONTEXT_TOKENS`)
-- **5가지 작업 종류** — `doc`(문서), `code`(격리된 git worktree 코드 변경), `sys`(오케스트레이터 자신의 변경, 샌드박스 사본 + 자동 체크 통과 시에만 반영), `test`(프로젝트 임시 복사본에서 시험), `task`(다음 작업 작성)
+- **5가지 작업 종류** — `doc`(문서), `code`(origin별로 Claude가 이름 지은 `src/<프로젝트>/` 폴더의 코드 작업, git 미사용), `sys`(오케스트레이터를 포함한 프로젝트 전체의 변경, 샌드박스 사본 + 자동 체크 통과 시에만 반영), `test`(프로젝트 임시 복사본에서 시험), `task`(다음 작업 작성)
+- **작업 범위 제한** — 쓰기 권한이 있는 worker(code·sys·test)의 Edit/Write는 자기 작업 폴더 안에서만 허용됨 (Claude: PreToolUse hook, Gemini: `gemini_guard.py`). doc·task worker와 reviewer·planner는 읽기 전용
 - **작업 목록 소스 선택** — 작업을 `TASKS.md`에 적거나 Notion 데이터베이스의 행으로 관리함 (`[tasks] source`). Notion을 쓰면 `TASKS.md`는 그 캐시가 됨
 - **후속 작업 자동 추가** — 작업 중 별도 Task가 필요한 일을 발견하면 에이전트가 요청하고, 성공한 Task에 한해 오케스트레이터가 작업 목록 끝에 pending으로 추가함 (`[tasks] follow_ups`, Task당 최대 5개). 후속 작업은 사람이 쓴 원래 Task(origin)에 `ref: Txx (origin)`으로 묶이고, 깊이·개수 상한이 있음
 - **사람 조치 추적** — merge·commit·결정처럼 사람만 할 수 있는 일은 Task가 아니라 해당 Task의 `todo:` 줄로 기록되고, 그 Task를 기반으로 하는 작업은 처리될 때까지 대기함
@@ -90,12 +91,13 @@ python3 -m venv .venv
 
    - 간격은 run **시작** 기준. run이 간격보다 오래 걸리면 끝나자마자 다음 run 시작 (겹쳐 돌지 않음)
    - 매 run은 새 프로세스로 실행됨 → 작업 목록·`orch.toml`·`[sys]` 작업이 바꾼 코드가 다음 run에 반영됨
-   - pending 작업이 없거나 전부 `after:` 선행 실패로 blocked이거나 사람의 `todo:`를 기다리면 run을 만들지 않고 다음 주기까지 대기함
+   - pending·failed 작업이 없거나 전부 `after:` 선행 실패로 blocked이거나 사람의 `todo:`를 기다리면 run을 만들지 않고 다음 주기까지 대기함
+   - failed(`[!]`) 작업도 매 주기 다시 실행됨 → 계속 실패하는 작업은 주기마다 비용이 듦. 멈추려면 그 Task 아래에 `todo:` 줄 추가
    - 설정·작업 목록 오류(`error: ...`)가 나도 멈추지 않고 다음 주기에 다시 확인함 (시작 시점의 `orch.toml` 오류만 즉시 종료)
    - run 도중 Ctrl+C → 해당 run이 작업을 pending으로 되돌린 뒤 종료됨
    - 후속 작업(follow-up)·`[task]` 작업이 추가한 Task도 다음 주기에 실행됨 → 후속 작업 체인은 `max_followup_depth`·`max_followups_per_origin`에서 멈춤. 아예 끄려면 `[tasks] follow_ups = false`
 
-4. 결과 확인 — `doc/[Txx]_<날짜>_<제목>.md`, `git diff --cached`(code), `report/[Txx]_<날짜>_<제목>.md`(Task별 진행 보고), `.orch/runs/<run-id>/summary.md`
+4. 결과 확인 — `doc/[Txx]_<날짜>_<제목>.md`, `src/<프로젝트>/`(code), `report/[Txx]_<날짜>_<제목>.md`(Task별 진행 보고), `.orch/runs/<run-id>/summary.md`
 
 ## Windows / macOS
 
@@ -142,7 +144,7 @@ python3 -m venv .venv
 | | `max_retries` | `0` | — | API 요청 실패(429 quota·네트워크) 재시도 횟수(0~9). `0` = 즉시 실패 (CLI 기본은 요청당 10회) |
 | `[roles.<역할>]` | `provider`, `model` | — | — | 역할별 override |
 
-- 역할: `doc-worker`, `code-worker`, `sys-worker`, `test-worker`, `task-worker`, `reviewer`, `doc-merger`, `code-merger`, `planner`, `namer`, `reporter`
+- 역할: `doc-worker`, `code-worker`, `sys-worker`, `test-worker`, `task-worker`, `reviewer`, `doc-merger`, `planner`, `namer`, `reporter`
 - 역할의 model 결정 순서: `[roles.<역할>] model` → (namer·reporter만) provider의 `small_model` → provider의 `model` → CLI 기본 모델
 - `--model`·`--cli-path`는 기본 provider(`--provider` 또는 `[agent] provider`)의 `model`·`cli_path`만 바꾸며 `[roles.*]` override와 다른 provider 설정은 그대로 유지됨
 - `orch preview`에 적용된 설정 파일, 작업 목록 소스, follow-up 설정, 역할별 provider/model이 표시됨
@@ -213,7 +215,8 @@ claude와 gemini는 interface가 같은 backend로 대칭 구성됨.
 - `<kind>` : `doc` / `code` / `sys` / `test` / `task` 중 하나
 - `<role>` : (선택) `.claude/skills/develop/<role>.md` 스킬 추가 주입 (예: `code:refactorer`, `doc:researcher`)
 - 작업 ID는 줄 순서를 따름(`T01`, `T02`, …). 새 작업은 목록 끝에 추가해야 기존 ID와 이를 가리키는 `after:`·`ref:`가 유지됨 (Notion 모드는 `task` 속성이 ID)
-- 상태 마커: `[ ]` 대기, `[~]` 실행 중, `[x]` 완료, `[!]` 실패. `[!]`/`[x]`를 `[ ]`로 되돌리면 재시도됨
+- 상태 마커: `[ ]` 대기, `[~]` 실행 중, `[x]` 완료, `[!]` 실패. 실행 시 `[ ]`와 `[!]`가 함께 실행됨 → 실패한 Task는 다음 run에서 자동 재시도됨. `[x]`를 `[ ]`로 되돌리면 다시 실행됨
+  - 실패한 Task를 재시도하지 않으려면 그 아래에 `todo:` 줄을 추가함 (`todo:`가 남아 있는 동안 실행되지 않음)
   - `after:` 작업이 성공하지 못한 Task는 `[ ]`(blocked)로 남고 다음 run에 다시 시도됨
   - 처리되지 않은 `todo:`에 막힌 Task는 `waiting:`으로 표시되고 그 `todo:`가 끝날 때까지 시작되지 않음
 - `TASKS.md` 상단 주석은 요약본(quick reference)이며, 상세 설명은 이 섹션이 기준임
@@ -223,8 +226,8 @@ claude와 gemini는 interface가 같은 backend로 대칭 구성됨.
 | kind | 설명 | 결과물 위치 |
 |---|---|---|
 | `doc` | 리서치/작성/분석 → Markdown 산출물 | `doc/[Txx]_<YYMMDD>_<제목>.md` |
-| `code` | 격리된 git worktree에서 하는 코드 변경. HEAD + 미커밋 변경(snapshot)에서 시작하고, 같은 run에서 먼저 반영된 code 결과 위에서 시작함 | 워킹 트리에 staged 상태로 반영 (`git diff --cached`). 같은 run의 결과는 통합 branch(`orch/<run-id>/applied`)에 차례로 3-way merge된 뒤 반영됨 |
-| `sys` | 오케스트레이터 자신(`.orch/`, `.claude/`, `CLAUDE.md`, `README.md`, `TASKS.md`, `orch.toml`, `orch*.bat`, `orch*.sh`)의 변경 | 자동 체크·리뷰 통과 시 실제 파일에 적용, 원본은 `.orch/runs/<run-id>/<Txx>/backup/`에 백업 |
+| `code` | origin 목표의 프로젝트 폴더 `src/<프로젝트>/`에서 하는 코드 작업 (git 미사용). 폴더 이름은 origin의 첫 code 작업이 시작될 때 Claude(namer)가 영문 snake_case로 지음 (예: `ai_grader`). 같은 origin의 후속 작업은 같은 폴더를 이어서 씀. 한 폴더에는 한 번에 code 작업 하나만 실행됨 (다른 폴더끼리는 병렬). `mode: full`로 분할된 part는 폴더의 임시 사본에서 작업 후 폴더로 병합됨 | `src/<프로젝트>/`에 그대로 남음. 체크·리뷰를 통과하지 못하면 폴더가 작업 전 상태로 롤백되고, 시도한 버전은 `.orch/runs/<run-id>/<Txx>/changes/`에 보관됨 |
+| `sys` | 프로젝트 전체의 변경 — 오케스트레이터 자신(`.orch/`, `.claude/`, `CLAUDE.md`, `README.md`, `TASKS.md`, `orch.toml`, `orch*.bat`, `orch*.sh`)과 그 외 모든 폴더(`src/`, `doc/` 등). `.git`, `.orch/runs`·`.orch/worktrees`·`.orch/code_folders.json`, 캐시·가상환경(`.venv`, `node_modules` 등), local·secret 파일(`.env*`, `.mcp.json`, `settings.local.json`, `*.log`)은 제외 | 자동 체크·리뷰 통과 시 실제 파일에 적용, 원본은 `.orch/runs/<run-id>/<Txx>/backup/`에 백업 |
 | `test` | 프로젝트 전체의 임시 복사본(미커밋 변경 포함, `.git`·run 기록 제외)에서 파일 수정·명령 실행으로 시험 | 진행 보고만 남음 (복사본은 run 종료 시 삭제, 실제 프로젝트는 변경 없음) |
 | `task` | 다음 작업 작성 — 결과물이 작업 목록 문법의 새 task 목록이며 다른 결과물처럼 리뷰됨 (최대 20개) | run 종료 시 작업 목록 끝에 pending으로 추가, 다음 run에서 실행. 새 ID는 다음 빈 번호부터 매겨지고 agent에게 미리 알려줘서 `after:`로 서로 연결 가능 |
 
@@ -248,10 +251,10 @@ claude와 gemini는 interface가 같은 backend로 대칭 구성됨.
 | `after: Txx, Tyy` | 지정한 작업들이 끝날 때까지 대기 후 그 결과를 입력으로 사용. 지정한 작업에 처리되지 않은 `todo:`가 있으면 그것이 끝날 때까지 대기 |
 | `ref: <path\|URL>` | 작업의 근거 자료(파일/폴더/glob/URL). 작은 텍스트 파일은 프롬프트에 직접 삽입되고 리뷰어가 대조 검증함. 경로는 프로젝트 기준 상대 경로이고, 구분자는 OS와 무관하게 `/`, `\` 모두 가능하며 `~\doc\x.md`도 프로젝트 루트 기준으로 해석됨. 존재하지 않는 경로가 있으면 run이 시작되지 않음. 여러 개는 줄을 나눠 적음 |
 | `ref: Txx` | 그 작업의 결과물과 리뷰 이력을 근거 자료로 씀(같은 run이면 대기). 작업 ID는 한 줄에 여러 개 적을 수 있고 경로와 섞어도 됨: `ref: T01, T02`, `ref: T01 T02`, `ref: T01, doc/x.md`. 완료된 Task가 참조 작업의 현재 결과보다 이전 결과를 기반으로 만들어졌으면 preview가 알려줌 |
-| `ref: Txx (origin)` | 후속 작업이 섬기는 목표 — 체인이 시작된, 사람이 쓴 Task. 오케스트레이터가 후속 작업마다 자동 기록하며 `ref: Txx`처럼 그 결과를 근거 자료로 씀 |
-| `todo: <할 일>` | 사람만 할 수 있는 조치(merge·commit·결정 등). 이 줄이 남아 있는 동안 이 Task와 이를 기반으로 하는 Task는 실행되지 않음. 처리 후 줄을 지우거나 `todo: [x] <할 일>`로 표시함(완료 기록은 이후 작업의 참고 정보로 전달됨). 에이전트 제안이나 오케스트레이터(반영 실패한 code 결과)가 자동 기록함 |
+| `ref: Txx (origin)` | 후속 작업이 섬기는 목표 — 체인이 시작된, 사람이 쓴 Task. 오케스트레이터가 후속 작업마다 자동 기록하며 `ref: Txx`처럼 그 결과를 근거 자료로 씀. code 작업은 origin의 프로젝트 폴더 `src/<프로젝트>/`에서 작업하므로, 사람이 쓴 code 작업도 이 줄을 적으면 기존 origin의 폴더를 이어서 씀 |
+| `todo: <할 일>` | 사람만 할 수 있는 조치(merge·commit·결정 등). 이 줄이 남아 있는 동안 이 Task와 이를 기반으로 하는 Task는 실행되지 않음. 처리 후 줄을 지우거나 `todo: [x] <할 일>`로 표시함(완료 기록은 이후 작업의 참고 정보로 전달됨). 에이전트 제안으로 자동 기록되기도 함 |
 | `lang: en` | doc 산출물 출력 언어 지정 (기본값: 한국어) |
-| `verify: <command>` | code/sys 작업에서 반드시 통과해야 하는 쉘 커맨드. Windows는 `cmd.exe`, macOS/Linux는 `/bin/sh`에서 실행됨 |
+| `verify: <command>` | code/sys 작업에서 반드시 통과해야 하는 쉘 커맨드. code는 `src/<프로젝트>/`, sys는 sandbox 루트에서 실행됨. Windows는 `cmd.exe`, macOS/Linux는 `/bin/sh`에서 실행됨 |
 | `mode: full` | 대규모 작업을 1~4개 에이전트로 분할하는 멀티 에이전트 파이프라인 사용 (기본값: standard, 1에이전트+1리뷰). `test`·`task`에는 적용 안 됨 |
 | `→ result: <location>` | 작업 성공 시 오케스트레이터가 자동 기록 — `doc`은 `doc/` 문서, 그 외 kind는 `report/` 진행 보고 경로. `after:`·`ref: Txx`가 이 값을 읽음. 사람이 직접 쓸 필요 없으며, 재실행 시 그대로 두거나 지워도 됨 |
 
@@ -340,11 +343,12 @@ claude와 gemini는 interface가 같은 backend로 대칭 구성됨.
 ## 결과물 확인
 
 - `doc` → `doc/[Txx]_<YYMMDD>_<제목>.md` (1작업당 1문서). 문서에는 본문만 들어가고, 작성자의 가정 사항·병합 메모·미해결 리뷰 지적은 진행 보고로 감
-- `code` → 워킹 트리에 staged 변경 (`git diff --cached`로 리뷰)
-  - 이전 run에서 staged만 하고 commit하지 않은 결과도 다음 run의 base에 포함되므로 반영을 막지 않음
-  - 같은 run의 결과끼리 같은 파일을 고쳐도 통합 branch에서 3-way merge됨. 충돌은 code-merger 에이전트가 해결하고, `verify:`가 있으면 다시 통과해야 함
-  - 반영되지 않는 경우는 run 도중 사람이 같은 파일을 고쳤거나 merge 충돌이 해결되지 않았을 때뿐임. 이때 patch가 `.orch/runs/<run-id>/<Txx>/apply.patch`에 남고, 적용 방법이 그 Task의 `todo:`로 기록됨
-- `sys` → 시스템 파일에 직접 적용, 원본 백업은 `.orch/runs/<run-id>/<Txx>/backup/`, 전체 diff는 `sys.diff`
+- `code` → `src/<프로젝트>/` 폴더에 그대로 남음 (git 미사용, 전체 diff는 `.orch/runs/<run-id>/<Txx>/code.diff`)
+  - 폴더 이름은 origin의 첫 code 작업이 시작될 때 namer(`small_model`)가 origin의 제목·지시문을 보고 짓는 영문 snake_case 프로젝트 이름임 (소문자·숫자·`_`, 최대 30자). 이미 있는 폴더·기록된 이름과 겹치면 `_2`, `_3`…이 붙음. 이름을 못 받으면 origin ID(`t01`)를 씀
+  - 지은 이름은 `.orch/code_folders.json`에 origin별로 기록되고(Notion은 page id, `TASKS.md`는 ID + 제목 기준), 후속 작업은 `ref: Txx (origin)`을 따라 같은 폴더에서 작업함. 파일 목록 reset 후 같은 ID라도 제목이 다르면 새 origin으로 보고 새 이름을 지음. 폴더를 바꾸려면 이 파일의 `folder` 값을 고침. `orch-reset`은 이 파일과 `src/`를 지우지 않음
+  - 작업 시작 시 폴더를 base로 복사해 diff·리뷰·롤백에 씀. 실패하거나 CRITICAL·체크 실패로 block되면 폴더를 base로 되돌리고 시도한 파일은 `.orch/runs/<run-id>/<Txx>/changes/`에 보관함
+  - 같은 폴더의 code 작업은 차례로 실행됨. `mode: full`의 part는 폴더의 임시 사본에서 작업하고, 끝나면 폴더로 3-way 병합됨(`git merge-file`, repo 불필요). 같은 줄을 고친 part가 있으면 병합 실패로 처리됨
+- `sys` → 프로젝트 파일에 직접 적용, 원본 백업은 `.orch/runs/<run-id>/<Txx>/backup/`, 전체 diff는 `sys.diff`
 - `test` → 진행 보고만 남음 (테스트 결과·복사본에서 바꾼 파일 목록 포함)
 - `task` → 작업 목록에 새 pending task 추가 (추가된 ID는 진행 보고와 `summary.md`에 기록)
 - 후속 작업 → 성공한 Task가 요청한 만큼 작업 목록 끝에 pending으로 추가됨 (`TASKS.md`의 줄 또는 새 Notion 행). 추가된 ID·제목은 진행 보고의 "남은 이슈 및 후속 조치"와 `summary.md`에 기록됨
@@ -366,10 +370,11 @@ claude와 gemini는 interface가 같은 backend로 대칭 구성됨.
 ├── orch.toml                       # Config 설정
 ├── CLAUDE.md                       # Claude Code 전역 규칙
 ├── doc/                            # doc 작업 결과물
+├── src/                            # code 작업 결과물 (origin별 폴더)
 ├── report/                         # Task별 진행 보고
 └── .orch/                          # 오케스트레이터 패키지
    ├── core/                       # 설정, 작업 목록, Task 모델
-   ├── workspace/                  # git worktree, sys 샌드박스
+   ├── workspace/                  # code 폴더·sys 샌드박스·test 사본, 자동 체크
    ├── agents/                     # provider별 에이전트 호출 (Claude, Gemini)
    ├── reporting/                  # 리뷰 집계, summary, 진행 보고
    ├── pipeline/                   # Plan → Work → Review → Merge

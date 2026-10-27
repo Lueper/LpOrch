@@ -9,7 +9,7 @@ import re
 from pathlib import Path
 
 from core.paths import IsOsMetadata
-from core.tasks import STATUS_DONE, SYS_APPLIED_PREFIX, Task
+from core.tasks import APPLIED_PREFIX, STATUS_DONE, Task
 
 URL_PATTERN = re.compile(r"^https?://", re.IGNORECASE)
 GLOB_CHARS = re.compile(r"[*?\[]")
@@ -72,9 +72,9 @@ def RefTasks(task: Task) -> list[Task]:
 
 
 def ResultFiles(task: Task, projectDir: Path) -> list[Path]:
-    """Files a task's result points at: its document (doc) or progress report (other kinds); a sys task's result
-    names the system files it applied until its report is written, and older result lines still do."""
-    names = task.resultRef.removeprefix(SYS_APPLIED_PREFIX).split(", ") if task.resultRef.startswith(SYS_APPLIED_PREFIX) else [task.resultRef]
+    """Files a task's result points at: its document (doc) or progress report (other kinds); a sys or code task's
+    result names the files it applied until its report is written, and older result lines still do."""
+    names = task.resultRef.removeprefix(APPLIED_PREFIX).split(", ") if task.resultRef.startswith(APPLIED_PREFIX) else [task.resultRef]
     paths = [projectDir / name for name in names if name]
     return [path.resolve() for path in paths if path.is_file()]
 
@@ -163,8 +163,14 @@ def TaskContext(task: Task, embedRefs: bool = False, withHistory: bool = False) 
         lines += ["Details:", task.detailText]
     if task.outputLang:
         lines.append(f"Output language: {task.outputLang} (keep established technical terms in English)")
+    if task.codeDir:
+        lines.append(
+            f"Code folder: {task.codeDir} - the code of this task's origin goal lives there, and only files inside it"
+            " are kept; it is not a git repository"
+        )
     if task.verify:
-        lines.append(f"Required check: `{task.verify}` must pass; the orchestrator runs it after every change")
+        where = " in the code folder" if task.codeDir else ""
+        lines.append(f"Required check: `{task.verify}` must pass; the orchestrator runs it{where} after every change")
     if task.upstream:
         lines.append("Builds on these earlier tasks - read their results and treat them as given inputs:")
         lines += [f"- {up.id} ({up.kind}) {up.title}: {up.resultRef or 'location not recorded'}" for up in task.upstream]

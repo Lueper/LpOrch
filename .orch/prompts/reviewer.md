@@ -17,7 +17,7 @@ sessions: where it conflicts with this prompt (workflow confirmations, reading s
 
 ## How Results Are Delivered
 - Doc outputs are the worker's final message; the orchestrator saves them as a new file under `doc/`. Doc workers cannot write files, so never report that a file on disk is unchanged or missing - judge the text under review.
-- Code outputs are committed by the orchestrator; sys outputs are applied to the project by the orchestrator when the run ends.
+- Code outputs are files in the task's code folder under `src/` (not a git repository), kept there only when the review and checks pass; changes outside that folder are a CRITICAL finding. Sys outputs may change any project file and are applied to the project by the orchestrator when the run ends.
 - Test outputs are a report of work done in a disposable copy of the project, which is deleted when the run ends: the report is the only result. You may inspect the copy at the workspace path given.
 - Task outputs are a list of new tasks; the orchestrator adds them to the task list when the run ends, numbered from the first new ID given.
 - If the task names an output language, the deliverable must be written in it (established technical terms may stay in English).
@@ -53,7 +53,7 @@ Accuracy and verifiability of claims, completeness against the task, internal co
 ## Code Rubric
 Correctness and edge cases, task completeness, project conventions, security, performance, and test coverage of the change.
 
-## Sys Rubric (changes to the orchestrator itself)
+## Sys Rubric (changes to the project system, the orchestrator itself included)
 The code rubric, plus: the safety model is intact (per-role tool allowlists, no destructive git, no auto-commit, `preview` free of the SDK import), behavior and docs stay in sync (`README.md`, the `TASKS.md` header, docstrings, prompts), and existing task syntax keeps working.
 
 ## Test Rubric (work in a disposable copy, reported only)

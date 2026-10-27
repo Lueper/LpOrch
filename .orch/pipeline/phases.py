@@ -2,15 +2,18 @@
 from __future__ import annotations
 
 import asyncio
+import re
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from agents.runner import AgentSpec, LoadPrompt, LoadSkill, RunAgent, WriteText
 from core.context import TaskContext
+from core.paths import SRC_DIR_NAME, CodeOrigin, ReadCodeFolders, RecordCodeFolder, RecordedCodeFolder
 from core.runcontext import RunContext
 from core.taskfile import FOLLOWUP_MARKER, SplitFollowUps
 from core.tasks import MAX_FOLLOWUPS, MAX_WRITTEN_TASKS, HasCritical, Part, PartNeedsRevision, Task, TaskId
 from reporting.report import CheckText, FindingLines
-from workspace import gitops, sandbox
+from workspace import sandbox
 
 MAX_EMBED_CHARS = 60_000  # cap inlined outputs; agents can still Read the full file
 MAX_UNREAD_SHOWN = 3  # unreadable follow-up lines quoted in a note; the rest are counted
@@ -19,7 +22,11 @@ MAX_COPY_ERROR_CHARS = 500  # shutil.Error lists every file it could not copy
 # CRITICAL issue: every request of a resumed session re-reads its whole context, so fixing a few WARNINGs on top
 # of a long session costs more than a fresh worker reading the files it needs. CRITICAL fixes keep the context.
 FRESH_FIX_CONTEXT_TOKENS = 60_000
-RESPONSE_MARKER = "=== REVIEW RESPONSE ==="  # splits a revision's output from the author's answer to the review
+FOLDER_SCHEMA = {"type": "object", "properties": {"folder": {"type": "string"}}, "required": ["folder"]}
+FOLDER_NAME_JUNK = re.compile(r"[^a-z0-9]+")  # a code folder's name is snake_case: a-z, 0-9 and "_"
+MAX_FOLDER_CHARS = 30
+NAMER_DETAIL_CHARS = 2000  # the goal's detail lines the folder namer sees
+RESPONSE_MARKER = "=== REVIEW RESPONSE ===" # splits a revision's output from the author's answer to the review
 NOTES_MARKER = "=== NOTES FOR THE REPORT ==="  # splits a document from notes that belong in the progress report
 NOTES_DELIVERY = (
     f"Keep notes out of the document: assumptions you made (or, when merging, conflicts between parts and how you "
@@ -28,8 +35,11 @@ NOTES_DELIVERY = (
 )
 DELIVERY = {
     "doc": f"Your final message must be the complete Markdown content for your part. {NOTES_DELIVERY}",
-    "code": "Edit the files in this worktree, then end with a short summary: files changed, rationale, test results, assumptions.",
-    "sys": "Edit the system files in this sandbox, then end with a short summary: files changed, rationale, check results, assumptions.",
+    "code": (
+        "Edit the files in your working directory - the code folder, or a temporary copy of it for a split part - and"
+        " nowhere else, then end with a short summary: files changed, rationale, test results, assumptions."
+    ),
+    "sys": "Edit the project files in this sandbox, then end with a short summary: files changed, rationale, check results, assumptions.",
     "test": (
         "Do the task in this disposable copy of the project: change files and run commands as it needs. Nothing you "
         "change here is kept, so your final message is the only record - end with the test report: what you ran or "
@@ -97,17 +107,98 @@ def TaskListDelivery(firstNumber: int) -> str:
     ])
 
 
-async def GitCall(ctx: RunContext, function, *args):
-    """Run a blocking git helper off the event loop, one at a time: all tasks share one repository."""
-    async with ctx.gitLock:
-        return await asyncio.to_thread(function, *args)
-
-
 # ---------- workspaces ----------
 
+@asynccontextmanager
+async def CodeFolder(task: Task, ctx: RunContext):
+    """A code task's hold on its folder under src/ from planning to its result; other kinds pass straight through.
+
+    One code task at a time works in a folder - the tasks of other folders run in parallel. The folder as the task
+    found it is copied as its base (diffs, reviews, roll-back); unless the task succeeds, the folder is rolled back
+    to it, so only a result that passed its checks and reviews stays.
+    """
+    if task.kind != "code":
+        yield
+        return
+    task.codeDir = await CodeDir(task, ctx)
+    lock = ctx.codeLocks.setdefault(task.codeDir, asyncio.Lock())
+    if lock.locked():
+        ctx.log.info("[%s] waiting for %s: another code task works in it", task.id, CodeLabel(task, ctx))
+    async with lock:
+        task.codeDir.mkdir(parents=True, exist_ok=True)
+        task.baseDir = await asyncio.to_thread(sandbox.CopyTree, task.codeDir, ctx.worktreeDir / f"{task.id}-base")
+        try:
+            yield
+        except BaseException:  # crashed or the run was aborted: no half-done change stays (blocking, but brief)
+            RollBack(task, ctx)
+            raise
+        if not task.ok:
+            await asyncio.to_thread(RollBack, task, ctx)
+
+
+async def CodeDir(task: Task, ctx: RunContext) -> Path:
+    """src/<name>/ of the task's origin goal (paths.CodeOrigin): the name recorded in .orch/code_folders.json, so every
+    code task of the goal works in the same folder; a goal without one is named now by an agent and recorded."""
+    origin = CodeOrigin(task)
+    async with ctx.folderLock:  # one at a time: two new goals never get one name, a follow-up waits for its origin's
+        name = RecordedCodeFolder(origin, ctx.projectDir)
+        if name is None:
+            name = await NameCodeFolder(origin, task, ctx)
+            RecordCodeFolder(origin, ctx.projectDir, name)
+            ctx.log.info("[%s] code folder of %s (%s): %s/%s", task.id, origin.id, origin.title, SRC_DIR_NAME, name)
+    return ctx.projectDir / SRC_DIR_NAME / name
+
+
+async def NameCodeFolder(origin: Task, task: Task, ctx: RunContext) -> str:
+    """A snake_case project folder name for the goal, from the namer agent; one no folder under src/ and no goal has
+    yet (a "_2", "_3", ... suffix when needed). The goal's task ID when the agent gives none."""
+    folders = ReadCodeFolders(ctx.projectDir)
+    src = ctx.projectDir / SRC_DIR_NAME
+    taken = {path.name.lower() for path in src.iterdir() if path.is_dir()} if src.is_dir() else set()
+    taken |= {str(entry["folder"]).lower() for entry in folders.values()}
+    spec = AgentSpec(  # a one-shot chore: runs on the provider's small_model (orch.toml)
+        role="namer", cwd=ctx.runDir, systemAppend=LoadPrompt("namer"), schema=FOLDER_SCHEMA,
+    )
+    lines = [f"Name the project folder (a `folder`) for this goal: {origin.title}"]
+    if origin.details:
+        lines += ["Details:", origin.detailText[:NAMER_DETAIL_CHARS]]
+    lines.append(f"Names already taken under {SRC_DIR_NAME}/: {', '.join(sorted(taken)) or 'none'}")
+    result = await RunAgent(f"{task.id} folder name", "\n".join(lines), spec, ctx)
+    task.costUsd += result.costUsd
+    data = result.structured if result.ok and isinstance(result.structured, dict) else {}
+    name = FolderName(str(data.get("folder", ""))) or FolderName(origin.id)
+    unique, counter = name, 2
+    while unique in taken:
+        unique, counter = f"{name}_{counter}", counter + 1
+    return unique
+
+
+def FolderName(text: str) -> str:
+    """text as a snake_case folder name: lower case, every run of other characters one "_", at most MAX_FOLDER_CHARS;
+    one that starts with a digit gets "project_" in front."""
+    name = FOLDER_NAME_JUNK.sub("_", text.lower()).strip("_")[:MAX_FOLDER_CHARS].rstrip("_")
+    return f"project_{name}" if name[:1].isdigit() else name
+
+
+def CodeLabel(task: Task, ctx: RunContext) -> str:
+    """"src/<title>" - a code task's folder as the project names it."""
+    return task.codeDir.relative_to(ctx.projectDir).as_posix()
+
+
+def RollBack(task: Task, ctx: RunContext) -> None:
+    """Put a code task's folder back as the task found it; the attempted versions of the files it changed are kept
+    in the run folder (<Txx>/changes/) for a person to look at."""
+    changed = [name for _, name in sandbox.Changes(task.baseDir, task.codeDir)]
+    if not changed:
+        return
+    kept = ctx.TaskDir(task.id) / "changes"
+    sandbox.SaveChangedFiles(task.codeDir, changed, kept)
+    sandbox.Restore(task.codeDir, task.baseDir)
+    task.notes.append(f"{CodeLabel(task, ctx)} rolled back ({len(changed)} file(s)); the attempted version is kept in {kept}")
+    ctx.log.info("[%s] %s rolled back: %s", task.id, CodeLabel(task, ctx), ", ".join(changed))
+
+
 async def RunWork(task: Task, ctx: RunContext) -> None:
-    if task.kind == "code":  # the code results this run applied so far, those of its "after:" tasks included
-        task.gitBase = ctx.appliedCommit or ctx.baseCommit
     problem = await asyncio.to_thread(PrepareSystemBase, task, ctx) if task.kind == "sys" else None
     for part in task.parts:
         part.error = problem or part.error
@@ -144,21 +235,12 @@ async def PrepareWorkspace(part: Part, ctx: RunContext) -> None:
             return
         part.worktree = part.workCwd = copy
         return
-    if part.kind == "sys":
-        sandboxDir = await asyncio.to_thread(sandbox.CopyTree, part.task.baseDir, ctx.worktreeDir / part.id)
-        part.worktree = part.workCwd = sandboxDir
+    if part.kind == "code" and len(part.task.parts) == 1:  # works in the folder itself, which CodeFolder holds
+        part.worktree = part.workCwd = part.task.codeDir
         return
-    if ctx.repoRoot is None:
-        part.error = "code tasks need the project to be a git repository with at least one commit"
-        return
-    branch = f"orch/{ctx.runId}/{part.id}"
-    worktree = ctx.worktreeDir / part.id
-    try:
-        await GitCall(ctx, gitops.CreateWorktree, ctx.repoRoot, worktree, branch, part.task.gitBase)
-    except gitops.GitError as error:
-        part.error = str(error)
-        return
-    part.branch, part.worktree, part.workCwd = branch, worktree, worktree
+    # sys: a sandbox; a split code part: a temporary copy of the folder, merged into it (merge.MergeCodeTask)
+    copy = await asyncio.to_thread(sandbox.CopyTree, part.task.baseDir, ctx.worktreeDir / part.id)
+    part.worktree = part.workCwd = copy
 
 
 # ---------- work ----------
@@ -170,20 +252,19 @@ async def RunWorker(part: Part, ctx: RunContext) -> None:
     prompt = WorkerPrompt(part, ctx.config.followUps, ctx.nextTaskNumber)
     result = await RunAgent(f"{part.id} work", prompt, spec, ctx)
     part.costUsd += result.costUsd
-    if not result.ok:
+    if not result.ok:  # the part fails: its sandbox is never applied, and CodeFolder rolls a code folder back
         part.error = result.error
-        await ParkPartialEdits(part, ctx, "failed work")
         return
     part.sessionId = result.sessionId
     part.contextTokens = result.tokens.peakContext if result.tokens else 0
     text = TakeFollowUps(part, result.text, ctx)
-    if not await SaveOutput(part, text, ctx, f"orch({part.id}): {part.title[:60]}"):
+    if not await SaveOutput(part, text, ctx):
         part.error = "worker finished without changing any files"
         return
     await RunChecks(part, part.task, part.worktree, ctx)
 
 
-async def SaveOutput(part: Part, text: str, ctx: RunContext, commitMessage: str) -> bool:
+async def SaveOutput(part: Part, text: str, ctx: RunContext) -> bool:
     """Persist the latest output (archiving the previous round); True when files changed."""
     partDir = ctx.TaskDir(part.id)
     if part.kind in ("doc", "task"):  # task: output.md is the task list it wrote
@@ -197,18 +278,21 @@ async def SaveOutput(part: Part, text: str, ctx: RunContext, commitMessage: str)
         ArchiveAndWrite(partDir / "notes.md", text, part.revisions)
         ArchiveAndWrite(partDir / "changes.md", ChangeList(changes), part.revisions)
         return True
-    if part.kind == "sys":
-        changed = bool(await asyncio.to_thread(sandbox.Changes, part.task.baseDir, part.worktree))
-        diff = await asyncio.to_thread(sandbox.Diff, part.task.baseDir, part.worktree)
+    # code and sys: the workspace against the base the task started from
+    changed = bool(await asyncio.to_thread(sandbox.Changes, part.task.baseDir, part.worktree))
+    diff = await asyncio.to_thread(sandbox.Diff, part.task.baseDir, part.worktree)
+    if part.kind == "sys":  # a code folder may hold such files of its own (a .env, logs): only a sandbox is noted
         stray = await asyncio.to_thread(sandbox.OutOfScope, part.worktree)
         if stray:
-            part.notes.append(f"ignored files outside the system scope: {', '.join(stray[:5])}")
-    else:
-        changed = await GitCall(ctx, gitops.CommitAll, part.worktree, commitMessage)
-        diff = await GitCall(ctx, gitops.DiffAgainstBase, part.worktree, part.task.gitBase)
+            part.notes.append(f"ignored files that are never applied (secrets, logs): {', '.join(stray[:5])}")
     ArchiveAndWrite(partDir / "output.diff", diff, part.revisions)
     ArchiveAndWrite(partDir / "notes.md", text, part.revisions)
     return changed
+
+
+async def Checkpoint(workspace: Path, owner: str, ctx: RunContext) -> Path:
+    """A copy of a code or sys workspace before an agent edits it again, kept with the run's other workspaces."""
+    return await asyncio.to_thread(sandbox.Checkpoint, workspace, ctx.worktreeDir / f"{owner}.checkpoint")
 
 
 def ChangeList(changes: list[tuple[str, str]]) -> str:
@@ -224,10 +308,11 @@ def ArchiveAndWrite(path: Path, text: str, roundNo: int) -> None:
 
 
 async def ParkPartialEdits(part: Part, ctx: RunContext, reason: str, checkpoint: Path | None = None) -> None:
-    if part.kind == "code" and part.worktree:
-        await GitCall(ctx, gitops.StashChanges, part.worktree, f"orch: {reason} of {part.id}")
-    if part.kind == "sys" and checkpoint:  # sandboxes are applied as they are: roll the failed attempt back
-        await asyncio.to_thread(sandbox.Restore, part.worktree, checkpoint)
+    """Roll a failed revision back to its checkpoint: a workspace is used as it is, so the last good output stays."""
+    if checkpoint:
+        restored = await asyncio.to_thread(sandbox.Restore, part.worktree, checkpoint)
+        if restored:
+            ctx.log.info("[%s] %s rolled back: %s", part.id, reason, ", ".join(restored))
 
 
 async def RunChecks(subject, task: Task, workdir: Path | None, ctx: RunContext) -> None:
@@ -373,7 +458,7 @@ async def RunRevision(part: Part, ctx: RunContext) -> bool:
         resume=None if fresh else part.sessionId,  # resumed: the original worker revises with its full context
         addDirs=[*part.task.refDirs, ctx.TaskDir(part.id)] if fresh else part.task.refDirs,  # fresh: reads the diff
     )
-    checkpoint = await asyncio.to_thread(sandbox.Checkpoint, part.worktree) if part.kind == "sys" else None
+    checkpoint = await Checkpoint(part.worktree, part.id, ctx) if part.kind in ("code", "sys") else None
     checks = CheckText(part) if part.checkOk is False else ""
     if fresh:
         ctx.log.info("[%s] fix r%d in a fresh session (the worker session reached %d tokens of context)",
@@ -393,7 +478,7 @@ async def RunRevision(part: Part, ctx: RunContext) -> bool:
     output, response = SplitResponse(TakeFollowUps(part, result.text, ctx, replace=True))
     part.responses.append(response)
     WriteText(ctx.TaskDir(part.id) / f"response.r{review['round']}.md", response)
-    await SaveOutput(part, output, ctx, f"orch({part.id}): address review round {review['round']}")
+    await SaveOutput(part, output, ctx)
     await RunChecks(part, part.task, part.worktree, ctx)  # before counting the revision: archives keep round numbers
     part.revisions += 1
     return True

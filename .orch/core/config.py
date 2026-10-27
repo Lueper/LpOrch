@@ -19,7 +19,7 @@ CONFIG_FILE_NAME = "orch.toml"  # at the project root, next to TASKS.md
 # Every agent role; agents/runner.ROLE_TOOLS has the same keys
 ROLES = (
     "doc-worker", "code-worker", "sys-worker", "test-worker", "task-worker",
-    "reviewer", "doc-merger", "code-merger", "planner", "namer", "reporter",
+    "reviewer", "doc-merger", "planner", "namer", "reporter",
 )
 SMALL_ROLES = ("namer", "reporter")  # one-shot chores: the provider's small_model is enough
 ROLES_SECTION = "roles"  # [roles.<role>] tables override provider and model per role

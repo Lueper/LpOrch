@@ -7,6 +7,8 @@ write_file (as Write), replace (as Edit) and run_shell_command (as Bash) against
     is also checked part by part across &&, ||, ; and |)
   - PreToolUse command hooks whose matcher fits (e.g. protect-files.sh), run through bash with Claude Code's input;
     exit code 2 or a "block"/"deny" decision blocks the call
+  - the write scope of a write role: write_file and replace only inside its workspace, the folder gemini.py names in
+    WRITE_ROOT_ENV (OutsideWriteRoot, which claude.py's PreToolUse hook applies to Claude agents too)
 Blocking = exit code 2 with the reason on stderr. Fails closed: input or settings that cannot be read, or a hook that
 cannot be run, block the call too. SDK-free and standalone (stdlib only): the Gemini CLI runs it by its path.
 """
@@ -28,6 +30,7 @@ DENY_RULE = re.compile(r"^(?P<tool>\w+)(?:\((?P<pattern>.*)\))?$", re.DOTALL)
 COMMAND_SEPARATOR = re.compile(r"&&|\|\||;|\||\n")
 DEFAULT_HOOK_TIMEOUT = 60  # seconds, Claude Code's default
 BLOCK = 2  # the exit code both CLIs read as "deny this call"
+WRITE_ROOT_ENV = "ORCH_WRITE_ROOT"  # set by gemini.py for a write role: the only folder its file writes may change
 
 
 def Main() -> int:
@@ -38,13 +41,29 @@ def Main() -> int:
             return 0
         toolInput = event.get("tool_input") or {}
         settings = json.loads(SETTINGS_FILE.read_text(encoding="utf-8")) if SETTINGS_FILE.is_file() else {}
-        reason = DeniedByRule(settings, tool, toolInput, event) or DeniedByHook(settings, tool, toolInput, event)
+        root = os.environ.get(WRITE_ROOT_ENV)
+        outside = OutsideWriteRoot(toolInput, Path(event.get("cwd") or root), Path(root)) if root and tool != "Bash" else None
+        reason = outside or DeniedByRule(settings, tool, toolInput, event) or DeniedByHook(settings, tool, toolInput, event)
     except Exception as error:  # fail closed: a call that cannot be checked does not run
         reason = f"Blocked: the orchestrator's guard could not check this call ({type(error).__name__}: {error})"
     if reason:
         print(reason, file=sys.stderr)
         return BLOCK
     return 0
+
+
+# ---------- write scope ----------
+
+def OutsideWriteRoot(toolInput: dict, cwd: Path, root: Path) -> str | None:
+    """Why a file write leaves the agent's workspace - root, the only folder it may change - or None when it stays
+    inside. A relative path counts from cwd. Shell commands are not checked: the role prompt forbids writing elsewhere."""
+    target = str(toolInput.get("file_path") or toolInput.get("notebook_path") or "")
+    if not target:
+        return None
+    path = Path(target)
+    if (path if path.is_absolute() else cwd / path).resolve().is_relative_to(root.resolve()):
+        return None
+    return f"Blocked: {target} is outside this task's workspace {root}; only files inside it are kept"
 
 
 # ---------- permissions.deny ----------
